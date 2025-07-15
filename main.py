@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from masc_engine import create_masc_t_graph, MASCConfig, PersonaConfig, LLMConfig, ADVERSARY_PERSONAS
 
 load_dotenv()
+
 MODEL_ZOO = {
     "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
     "Anthropic": ["claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307"],
@@ -20,14 +21,20 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
     try:
         progress(0, desc="Parsing workflow configuration...")
 
-        proposer_llm = LLMConfig(provider=config_inputs[0],
-                                 api_key=config_inputs[1] or os.getenv(f"{config_inputs[0].upper()}_API_KEY"),
-                                 model_name=config_inputs[2], temperature=config_inputs[3])
+        proposer_llm = LLMConfig(
+            provider=config_inputs[0],
+            api_key=config_inputs[1] or os.getenv(f"{config_inputs[0].upper()}_API_KEY"),
+            model_name=config_inputs[2],
+            temperature=config_inputs[3],
+        )
         proposer_cfg = PersonaConfig(persona_name="Proposer", llm_config=proposer_llm)
 
-        synth_llm = LLMConfig(provider=config_inputs[4],
-                              api_key=config_inputs[5] or os.getenv(f"{config_inputs[4].upper()}_API_KEY"),
-                              model_name=config_inputs[6], temperature=config_inputs[7])
+        synth_llm = LLMConfig(
+            provider=config_inputs[4],
+            api_key=config_inputs[5] or os.getenv(f"{config_inputs[4].upper()}_API_KEY"),
+            model_name=config_inputs[6],
+            temperature=config_inputs[7],
+        )
         synthesizer_cfg = PersonaConfig(persona_name="Synthesizer", llm_config=synth_llm)
 
         adversary_cfgs = []
@@ -37,15 +44,19 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
             if chunk[0] != "NONE":
                 provider = chunk[1]
                 api_key = chunk[2] or os.getenv(f"{provider.upper()}_API_KEY")
-                if not api_key: raise gr.Error(f"API Key for {provider} (Adversary {i + 1}) is missing.")
-                adv_llm_cfg = LLMConfig(provider=provider, api_key=api_key, model_name=chunk[3], temperature=chunk[4])
+                if not api_key:
+                    raise gr.Error(f"API Key for {provider} (Adversary {i + 1}) is missing.")
+                adv_llm_cfg = LLMConfig(
+                    provider=provider, api_key=api_key, model_name=chunk[3], temperature=chunk[4]
+                )
                 adversary_cfgs.append(PersonaConfig(persona_name=chunk[0], llm_config=adv_llm_cfg))
 
-        if not adversary_cfgs: raise gr.Error("At least one Adversary must be configured.")
+        if not adversary_cfgs:
+            raise gr.Error("At least one Adversary must be configured.")
 
         masc_config = MASCConfig(proposer=proposer_cfg, synthesizer=synthesizer_cfg, adversaries=adversary_cfgs)
 
-        progress(0.1, desc="Compiling MASC-T Graph...")
+        progress(0.1, desc="Compiling MASC Graph...")
         graph = create_masc_t_graph()
 
         initial_state = {"task_description": task_desc, "config": masc_config}
@@ -79,24 +90,45 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
 
 def create_persona_ui(persona_name, is_adversary=False):
     with gr.Accordion(f"{persona_name} Configuration", open=True):
+        persona_selector = None
         if is_adversary:
-            persona_selector = gr.Dropdown(label="Persona Type", choices=["NONE"] + list(ADVERSARY_PERSONAS.keys()),
-                                           value="NONE")
+            persona_selector = gr.Dropdown(
+                label="Persona Type", choices=["NONE"] + list(ADVERSARY_PERSONAS.keys()), value="NONE"
+            )
+
         provider = gr.Dropdown(label="LLM Provider", choices=list(MODEL_ZOO.keys()), value="OpenAI")
+        model = gr.Dropdown(label="Model Name", choices=MODEL_ZOO[provider.value], value=MODEL_ZOO[provider.value][0])
         api_key = gr.Textbox(label="API Key", type="password", placeholder="Leave blank to use .env")
-        model = gr.Dropdown(label="Model Name", choices=MODEL_ZOO["OpenAI"])
         temp = gr.Slider(label="Temperature", minimum=0.0, maximum=1.5, step=0.1, value=0.1)
 
         def update_models(prov):
-            return gr.Dropdown(choices=MODEL_ZOO.get(prov, []))
+            choices = MODEL_ZOO.get(prov, [])
+            return gr.update(choices=choices, value=choices[0] if choices else None)
 
         provider.change(fn=update_models, inputs=provider, outputs=model)
-        if is_adversary: return persona_selector, provider, api_key, model, temp
-        return provider, api_key, model, temp
+
+        if is_adversary:
+            def toggle_adversary_inputs(persona_type):
+                disabled = persona_type == "NONE"
+                return (
+                    gr.update(disabled=disabled),
+                    gr.update(disabled=disabled),
+                    gr.update(disabled=disabled),
+                    gr.update(disabled=disabled),
+                )
+
+            persona_selector.change(
+                fn=toggle_adversary_inputs,
+                inputs=persona_selector,
+                outputs=[provider, api_key, model, temp],
+            )
+            return persona_selector, provider, api_key, model, temp
+        else:
+            return provider, api_key, model, temp
 
 
-with gr.Blocks(theme=gr.themes.Soft(), title="MASC-T Advanced Agent") as app:
-    gr.Markdown("# MASC-T: Advanced Cognitive Workflow Designer")
+with gr.Blocks(theme=gr.themes.Soft(), title="MASC Advanced Agent") as app:
+    gr.Markdown("# MASC: Advanced Workflow Designer")
     all_ui_inputs = []
     with gr.Row():
         with gr.Column(scale=1):
@@ -111,22 +143,24 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC-T Advanced Agent") as app:
                     synthesizer_inputs = create_persona_ui("Synthesizer")
                     all_ui_inputs.extend(synthesizer_inputs)
                 with gr.TabItem("Adversaries"):
-                    for i in range(MAX_ADVERSARIES): all_ui_inputs.extend(
-                        create_persona_ui(f"Adversary Slot {i + 1}", is_adversary=True))
-            run_button = gr.Button("Run MASC-T Workflow", variant="primary")
+                    for i in range(MAX_ADVERSARIES):
+                        all_ui_inputs.extend(create_persona_ui(f"Adversary Slot {i + 1}", is_adversary=True))
+            run_button = gr.Button("Run MASC Workflow", variant="primary")
         with gr.Column(scale=2):
             gr.Markdown("## 3. Results")
             with gr.Tabs():
-                with gr.TabItem("Final Synthesis"): final_synthesis_output = gr.Markdown()
+                with gr.TabItem("Final Synthesis"):
+                    final_synthesis_output = gr.Markdown()
                 with gr.TabItem("Process Breakdown"):
                     v1_proposal_output = gr.Markdown("### v1 Proposal")
                     critiques_output = gr.Code(label="Adversarial Critiques", language="json")
-                with gr.TabItem("Refinement History"): history_output = gr.Markdown()
+                with gr.TabItem("Refinement History"):
+                    history_output = gr.Markdown()
 
     run_button.click(
         fn=run_masc_t_cycle,
         inputs=all_ui_inputs,
-        outputs=[v1_proposal_output, critiques_output, final_synthesis_output, history_output]
+        outputs=[v1_proposal_output, critiques_output, final_synthesis_output, history_output],
     )
 
 if __name__ == "__main__":
