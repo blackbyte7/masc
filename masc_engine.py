@@ -35,6 +35,8 @@ class MASCConfig(BaseModel):
     proposer: PersonaConfig
     synthesizer: PersonaConfig
     adversaries: List[PersonaConfig]
+    # MODIFIED: Added selectable synthesis protocol
+    synthesis_protocol: Literal['Sequential Refinement', 'Architect'] = 'Sequential Refinement'
 
     model_config = {
         "arbitrary_types_allowed": True
@@ -154,7 +156,9 @@ class MASCNodes:
                 persona = ADVERSARY_PERSONAS[name]
                 prompt = ChatPromptTemplate.from_messages(
                     [("system", persona["system_prompt"]), ("human", "{artifact_content}")])
-                runnables[name] = prompt | llm.with_structured_output(Critique)
+
+                structured_llm = llm.with_structured_output(Critique)
+                runnables[name] = prompt | structured_llm
 
         results = RunnableParallel(**runnables).invoke({"artifact_content": v1_proposal_content})
         for name, result in results.items():
@@ -162,87 +166,141 @@ class MASCNodes:
             result.critique_type = ADVERSARY_PERSONAS[name]['critique_type']
         return {"critiques_collection": CritiquesCollection(critiques=list(results.values()))}
 
-    def synthesize(self, state: MASCState) -> dict:
-        logging.info("Entering Synthesizer Node")
+    def triage_critiques(self, state: MASCState) -> dict:
+        logging.info("Entering Triage Node (for Sequential Refinement)")
+        config = state['config'].synthesizer
+        llm = self._get_llm(config.llm_config)
+
+        critiques_json = state['critiques_collection'].json(indent=2)
+        task_description = state['task_description']
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a Triage Planner. Your task is to analyze the source, type, and severity of each critique. "
+             "Sort the critiques into a prioritized processing queue to ensure the most critical issues are handled first. "
+             "The default order should be: ANTAGONISTIC critiques first, then CRITICAL, HIGH, MEDIUM, and LOW severity CONSTRUCTIVE critiques. "
+             "Your output must be the complete, reordered list of the original critique objects."),
+            ("human", "Task Description: {task_description}\n\nUnordered Critiques:\n\n{critiques_json}")
+        ])
+
+        triage_chain = prompt | llm.with_structured_output(CritiquesCollection)
+
+        logging.info("Re-ordering critiques for optimal refinement...")
+        sorted_critiques_collection = triage_chain.invoke({
+            "task_description": task_description,
+            "critiques_json": critiques_json
+        })
+
+        logging.info("Triage complete. New processing order established.")
+        return {"critiques_collection": sorted_critiques_collection}
+
+    def synthesize_sequential(self, state: MASCState) -> dict:
+        logging.info("Entering Synthesizer Node (Sequential Refinement)")
         config = state['config'].synthesizer
         llm = self._get_llm(config.llm_config)
 
         v1_proposal = state['v1_proposal']
         critiques_collection = state['critiques_collection']
-        antagonistic_critiques = [c for c in critiques_collection.critiques if c.critique_type == 'ANTAGONISTIC']
-        constructive_critiques = [c for c in critiques_collection.critiques if c.critique_type == 'CONSTRUCTIVE']
 
         current_artifact = v1_proposal
         history_log = v1_proposal.history.copy()
 
-        if antagonistic_critiques:
-            logging.info(f"Refuting {len(antagonistic_critiques)} antagonistic critiques.")
-            refutation_prompt = ChatPromptTemplate.from_messages([
-                ("system",
-                 "You are a Master Synthesizer. Your task is to harden an original proposal against these cynical, "
-                 "antagonistic arguments. Identify the core fallacious principles in the critiques and revise the "
-                 "proposal to explicitly defend against them. Add justifications, preambles, or foundational principles"
-                 " that make the artifact's core ideology more robust. Do not integrate the substance of the "
-                 "antagonistic feedback; your goal is to build a defense against it."),
-                ("human", "Original Proposal:\n\n{proposal}\n\nAntagonistic Critiques:\n\n{ant_critiques}")
-            ])
-            refutation_chain = refutation_prompt | llm
-            response = refutation_chain.invoke({"proposal": current_artifact.content, "ant_critiques": "\n".join(
-                [str(c.payload) for c in antagonistic_critiques])})
-            current_artifact.content = response.content
-            history_log.append(
-                f"Hardened proposal against critiques from: {[c.source_adversary for c in antagonistic_critiques]}")
+        for critique in critiques_collection.critiques:
+            if critique.critique_type == 'ANTAGONISTIC':
+                logging.info(f"Refuting antagonistic critique from {critique.source_adversary}")
+                refutation_prompt = ChatPromptTemplate.from_messages([
+                    ("system",
+                     "You are a Master Synthesizer. Your task is to harden an original proposal against this cynical, "
+                     "antagonistic argument. Identify the core fallacious principle in the critique and revise the "
+                     "proposal to explicitly defend against it. Add justifications or foundational principles"
+                     " that make the artifact's core ideology more robust. Do not integrate the substance of the "
+                     "antagonistic feedback; your goal is to build a defense against it."),
+                    ("human", "Original Proposal:\n\n{proposal}\n\nAntagonistic Critique:\n\n{ant_critique}")
+                ])
+                refutation_chain = refutation_prompt | llm
+                response = refutation_chain.invoke(
+                    {"proposal": current_artifact.content, "ant_critique": critique.json()})
+                current_artifact.content = response.content
+                history_log.append(f"Hardened proposal against critique from: {critique.source_adversary}")
 
-        logging.info(f"Integrating {len(constructive_critiques)} constructive critiques.")
-        rca_chain = ChatPromptTemplate.from_messages([
-            ("system",
-             "You are a metacognitive analyst. Your task is purely analytical. Given the following critique of an "
-             "artifact, do not solve the problem. Instead, identify the flawed underlying principle or mental model"
-             " that led to this flaw, and then propose a superior, corrected principle. Output a structured object "
-             "containing {{flawed_principle, corrected_principle}}."),
-            ("human", "Critique:\n\n{critique}")
-        ]) | llm
-
-        revision_chain = ChatPromptTemplate.from_messages([
-            ("system",
-             "You are a master editor. Your task is purely generative. Take the provided draft and systemically"
-             " rewrite the relevant sections to apply the corrected_principle. Ensure the new principle is applied"
-             " globally and consistently to fix not just the cited flaw, but all instances of that flawed thinking."),
-            ("human",
-             "Current Draft:\n\n{draft}\n\nCorrection Plan:\n\nFlawed Principle: {flawed_principle}\nCorrected Principle: {corrected_principle}")
-        ]) | llm
-
-        for critique in constructive_critiques:
-            for issue in critique.payload:
-                logging.info(f"Addressing issue from {critique.source_adversary}: {issue.get('description', 'N/A')}")
-                try:
-                    rca_response = rca_chain.invoke({"critique": issue['description']}).content
-                    flawed_principle = rca_response.split("flawed_principle:")[1].split("corrected_principle:")[
-                        0].strip()
-                    corrected_principle = rca_response.split("corrected_principle:")[1].strip()
-                    revision_response = revision_chain.invoke(
-                        {"draft": current_artifact.content, "flawed_principle": flawed_principle,
-                         "corrected_principle": corrected_principle})
-                    current_artifact.content = revision_response.content
+            elif critique.critique_type == 'CONSTRUCTIVE':
+                for issue in critique.payload:
+                    logging.info(
+                        f"Addressing constructive issue from {critique.source_adversary}: {issue.get('description', 'N/A')}")
+                    revision_prompt = ChatPromptTemplate.from_messages([
+                        ("system",
+                         "You are a master editor. Your task is to revise the following draft to address ONLY the specific critique provided. "
+                         "Your revision should be targeted and minimal, but comprehensive for the issue at hand. Do not change other parts of the draft."),
+                        ("human",
+                         "Current Draft:\n\n{draft}\n\nCritique to address:\n{issue_description}\n\nSuggested Recommendation:\n{recommendation}")
+                    ])
+                    revision_chain = revision_prompt | llm
+                    response = revision_chain.invoke({
+                        "draft": current_artifact.content,
+                        "issue_description": issue.get('description'),
+                        "recommendation": issue.get('recommendation')
+                    })
+                    current_artifact.content = response.content
                     history_log.append(
-                        f"Applied principle '{corrected_principle}' to address '{issue['description']}'.")
-                except Exception as e:
-                    logging.error(f"Could not process critique issue: {issue}. Error: {e}")
-                    history_log.append(f"Failed to apply principle for critique: '{issue['description']}'.")
+                        f"Applied fix for critique: '{issue.get('description')}' from {critique.source_adversary}.")
 
-        final_artifact = Artifact(version="2.0_final", content=current_artifact.content, history=history_log)
+        final_artifact = Artifact(version="2.0_final_sequential", content=current_artifact.content, history=history_log)
+        return {"final_synthesis": final_artifact}
+
+    def synthesize_architect(self, state: MASCState) -> dict:
+        logging.info("Entering Synthesizer Node (Architect Protocol - Placeholder)")
+        v1_proposal = state['v1_proposal']
+        critiques_collection = state['critiques_collection']
+
+        history_log = v1_proposal.history.copy()
+        history_log.append("Architect synthesis protocol selected. [This protocol is not fully implemented].")
+        history_log.append(f"Received {len(critiques_collection.critiques)} critiques for holistic review.")
+
+        # VIP, in a real implementation, this would involve clustering, conflict resolution etc.
+        final_content = (f"--- ARCHITECT PROTOCOL OUTPUT (PLACEHOLDER) ---\n\n"
+                         f"The 'Architect' synthesis protocol was activated. This advanced protocol would normally perform "
+                         f"holistic critique clustering, conflict resolution, and a single, unified revision.\n\n"
+                         f"As a placeholder, here is the original proposal that would have been refined:\n\n"
+                         f"{v1_proposal.content}")
+
+        final_artifact = Artifact(version="2.0_final_architect", content=final_content, history=history_log)
         return {"final_synthesis": final_artifact}
 
 
+def should_route_to_synthesis(state: MASCState) -> Literal["triage", "architect"]:
+    protocol = state['config'].synthesis_protocol
+    logging.info(f"Routing to synthesis protocol: {protocol}")
+    if protocol == 'Architect':
+        return "architect"
+    return "triage"
+
+
 def create_masc_t_graph():
-    """Builds the MASC-T graph. LLMs are instantiated inside the nodes."""
+    """Builds the MASC-T graph with conditional routing for synthesis protocols."""
     nodes = MASCNodes()
     graph_builder = StateGraph(MASCState)
+
     graph_builder.add_node("propose", nodes.propose)
     graph_builder.add_node("adversarial_analysis", nodes.adversarial_analysis)
-    graph_builder.add_node("synthesize", nodes.synthesize)
+
+    graph_builder.add_node("triage_critiques", nodes.triage_critiques)
+    graph_builder.add_node("synthesize_sequential", nodes.synthesize_sequential)
+    graph_builder.add_node("synthesize_architect", nodes.synthesize_architect)
+
     graph_builder.set_entry_point("propose")
     graph_builder.add_edge("propose", "adversarial_analysis")
-    graph_builder.add_edge("adversarial_analysis", "synthesize")
-    graph_builder.add_edge("synthesize", END)
+
+    graph_builder.add_conditional_edges(
+        "adversarial_analysis",
+        should_route_to_synthesis,
+        {
+            "triage": "triage_critiques",
+            "architect": "synthesize_architect"
+        }
+    )
+
+    graph_builder.add_edge("triage_critiques", "synthesize_sequential")
+    graph_builder.add_edge("synthesize_sequential", END)
+    graph_builder.add_edge("synthesize_architect", END)
+
     return graph_builder.compile()

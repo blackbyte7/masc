@@ -37,8 +37,10 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
         )
         synthesizer_cfg = PersonaConfig(persona_name="Synthesizer", llm_config=synth_llm)
 
+        synthesis_protocol_input = config_inputs[8]
+
         adversary_cfgs = []
-        adv_inputs = config_inputs[8:]
+        adv_inputs = config_inputs[9:]
         for i in range(MAX_ADVERSARIES):
             chunk = adv_inputs[i * 5: (i + 1) * 5]
             if chunk[0] != "NONE":
@@ -54,7 +56,12 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
         if not adversary_cfgs:
             raise gr.Error("At least one Adversary must be configured.")
 
-        masc_config = MASCConfig(proposer=proposer_cfg, synthesizer=synthesizer_cfg, adversaries=adversary_cfgs)
+        masc_config = MASCConfig(
+            proposer=proposer_cfg,
+            synthesizer=synthesizer_cfg,
+            adversaries=adversary_cfgs,
+            synthesis_protocol=synthesis_protocol_input
+        )
 
         progress(0.1, desc="Compiling MASC Graph...")
         graph = create_masc_t_graph()
@@ -74,10 +81,11 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
                 critiques_json = state["adversarial_analysis"]["critiques_collection"].json(indent=2)
                 yield v1_proposal_content, critiques_json, final_synthesis_content, history_md
 
-            if "synthesize" in state:
+            synthesis_output = state.get("synthesize_sequential") or state.get("synthesize_architect")
+            if synthesis_output:
                 progress(0.9, desc="Stage 3: Synthesis complete.")
-                final_synthesis_content = state["synthesize"]["final_synthesis"].content
-                history = state["synthesize"]["final_synthesis"].history
+                final_synthesis_content = synthesis_output["final_synthesis"].content
+                history = synthesis_output["final_synthesis"].history
                 history_md = "\n".join([f"- {entry}" for entry in history])
                 yield v1_proposal_content, critiques_json, final_synthesis_content, history_md
 
@@ -135,17 +143,31 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Advanced Agent") as app:
             gr.Markdown("## 1. Task Description")
             task_description_input = gr.Textbox(label="High-Level Goal", lines=5)
             all_ui_inputs.append(task_description_input)
+
             gr.Markdown("## 2. Workflow Configuration")
             with gr.Tabs():
                 with gr.TabItem("Core Roles"):
                     proposer_inputs = create_persona_ui("Proposer")
                     all_ui_inputs.extend(proposer_inputs)
+
                     synthesizer_inputs = create_persona_ui("Synthesizer")
                     all_ui_inputs.extend(synthesizer_inputs)
+
+                    # NEW: UI for selecting synthesis protocol
+                    synthesis_protocol_selector = gr.Radio(
+                        label="Synthesis Protocol",
+                        choices=['Sequential Refinement', 'Architect'],
+                        value='Sequential Refinement',
+                        info="Choose the method for resolving critiques. 'Architect' is a placeholder."
+                    )
+                    all_ui_inputs.append(synthesis_protocol_selector)
+
                 with gr.TabItem("Adversaries"):
                     for i in range(MAX_ADVERSARIES):
                         all_ui_inputs.extend(create_persona_ui(f"Adversary Slot {i + 1}", is_adversary=True))
+
             run_button = gr.Button("Run MASC Workflow", variant="primary")
+
         with gr.Column(scale=2):
             gr.Markdown("## 3. Results")
             with gr.Tabs():
