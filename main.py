@@ -2,21 +2,25 @@ import gradio as gr
 import os
 import traceback
 from dotenv import load_dotenv
+from langchain_core.caches import InMemoryCache
+from langchain.globals import set_llm_cache
 from masc_engine import create_masc_t_graph, MASCConfig, PersonaConfig, LLMConfig, ADVERSARY_PERSONAS
 
+set_llm_cache(InMemoryCache())
 load_dotenv()
 
 MODEL_ZOO = {
-    "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-    "Anthropic": ["claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307"],
-    "Google": ["gemini-1.5-pro-latest", "gemini-1.0-pro", "gemini-1.5-flash-latest"],
+    "OpenAI": ["gpt-4.1", "o3-pro", "o4-mini"],
+    "Anthropic": ["claude-4-opus-20250514","claude-4-sonnet-20250514","claude-3-7-sonnet-20250219"],
+    "Google": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
 }
 MAX_ADVERSARIES = 4
 
 
-def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=True)):
+async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=True)):
     """
     Orchestrates the MASC process as a generator, yielding real-time updates to the Gradio UI.
+    Runs asynchronously.
     """
     try:
         progress(0, desc="Parsing workflow configuration...")
@@ -70,7 +74,7 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
 
         v1_proposal_content, critiques_json, final_synthesis_content, history_md = "", "", "", ""
 
-        for state in graph.stream(initial_state, {"recursion_limit": 10}):
+        async for state in graph.astream(initial_state, {"recursion_limit": 10}):
             if "propose" in state:
                 progress(0.3, desc="Stage 1: Proposal received.")
                 v1_proposal_content = state["propose"]["v1_proposal"].content
@@ -78,7 +82,10 @@ def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=
 
             if "adversarial_analysis" in state:
                 progress(0.6, desc="Stage 2: Adversarial analysis complete.")
-                critiques_json = state["adversarial_analysis"]["critiques_collection"].json(indent=2)
+                if state["adversarial_analysis"]["critiques_collection"]:
+                    critiques_json = state["adversarial_analysis"]["critiques_collection"].json(indent=2)
+                else:
+                    critiques_json = '{"critiques": []}'
                 yield v1_proposal_content, critiques_json, final_synthesis_content, history_md
 
             synthesis_output = state.get("synthesize_sequential") or state.get("synthesize_architect")
@@ -153,7 +160,6 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Advanced Agent") as app:
                     synthesizer_inputs = create_persona_ui("Synthesizer")
                     all_ui_inputs.extend(synthesizer_inputs)
 
-                    # NEW: UI for selecting synthesis protocol
                     synthesis_protocol_selector = gr.Radio(
                         label="Synthesis Protocol",
                         choices=['Sequential Refinement', 'Architect'],

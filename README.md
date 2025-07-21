@@ -2,7 +2,7 @@
 
 # 🧠 MASC: Modular Adversarial Synergy Chain
 
-**Official Python implementation of the *Modular Adversarial Synergy Chain* architecture.**
+**Official (POC) Python implementation of the *Modular Adversarial Synergy Chain* architecture.**
 
 </div>
 
@@ -11,7 +11,7 @@
     <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
   </a>
   <a href="https://www.python.org">
-    <img src="https://img.shields.io/badge/Python-3.9+-3776AB.svg?logo=python" alt="Python 3.9+">
+    <img src="https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python" alt="Python 3.9+">
   </a>
   <a href="https://python.langchain.com/v0.2/docs/langgraph/">
     <img src="https://img.shields.io/badge/Built%20with-LangGraph-229540.svg" alt="Built with LangGraph">
@@ -35,11 +35,6 @@ The project's goal is to provide a clear, functional, and extensible tool for ex
 *   **Streaming Interface:** The Gradio UI streams results in real-time, providing a transparent view into the agent's multi-stage reasoning process as it happens.
 *   **Modern Architecture:** Built from the ground up using the latest LangChain v0.2 standards, including LangGraph for stateful agent execution.
 
-## 🚀 Live Demo
-
-The user interface provides full control over the MASC workflow, from high-level task definition to the specific model used by each internal agent persona.
-
-*(To create a GIF, use a tool like [ScreenToGif](https://www.screentogif.com/) or Kap to record the application window as you run a workflow.)*
 
 ## ⚙️ How It Works
 
