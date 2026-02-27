@@ -9,51 +9,59 @@ from masc_engine import create_masc_t_graph, MASCConfig, PersonaConfig, LLMConfi
 set_llm_cache(InMemoryCache())
 load_dotenv()
 
+# Updated for 2026 Models
 MODEL_ZOO = {
-    "OpenAI": ["gpt-4.1", "o3-pro", "o4-mini"],
-    "Anthropic": ["claude-4-opus-20250514","claude-4-sonnet-20250514","claude-3-7-sonnet-20250219"],
+    "OpenAI": ["gpt-4.5-preview", "o3-pro", "o4-mini", "gpt-4o"],
+    "Anthropic": ["claude-3-7-sonnet-20250219", "claude-4-opus-20250514", "claude-4-sonnet-20250514"],
     "Google": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
 }
 MAX_ADVERSARIES = 4
 
 
 async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=True)):
-    """
-    Orchestrates the MASC process as a generator, yielding real-time updates to the Gradio UI.
-    Runs asynchronously.
-    """
+    """Orchestrates the MASC process as an async generator, updating Gradio UI."""
     try:
         progress(0, desc="Parsing workflow configuration...")
 
+        # Unpack UI inputs systematically
         proposer_llm = LLMConfig(
             provider=config_inputs[0],
-            api_key=config_inputs[1] or os.getenv(f"{config_inputs[0].upper()}_API_KEY"),
+            api_key=config_inputs[1] or os.getenv(f"{config_inputs[0].upper()}_API_KEY", ""),
             model_name=config_inputs[2],
             temperature=config_inputs[3],
+            max_tokens=config_inputs[4]
         )
         proposer_cfg = PersonaConfig(persona_name="Proposer", llm_config=proposer_llm)
 
         synth_llm = LLMConfig(
-            provider=config_inputs[4],
-            api_key=config_inputs[5] or os.getenv(f"{config_inputs[4].upper()}_API_KEY"),
-            model_name=config_inputs[6],
-            temperature=config_inputs[7],
+            provider=config_inputs[5],
+            api_key=config_inputs[6] or os.getenv(f"{config_inputs[5].upper()}_API_KEY", ""),
+            model_name=config_inputs[7],
+            temperature=config_inputs[8],
+            max_tokens=config_inputs[9]
         )
         synthesizer_cfg = PersonaConfig(persona_name="Synthesizer", llm_config=synth_llm)
 
-        synthesis_protocol_input = config_inputs[8]
+        synthesis_protocol_input = config_inputs[10]
 
         adversary_cfgs = []
-        adv_inputs = config_inputs[9:]
+        adv_inputs = config_inputs[11:]
+
+        # Each adversary has 6 inputs now (Type, Provider, Key, Model, Temp, Max_Tokens)
         for i in range(MAX_ADVERSARIES):
-            chunk = adv_inputs[i * 5: (i + 1) * 5]
+            chunk = adv_inputs[i * 6: (i + 1) * 6]
             if chunk[0] != "NONE":
                 provider = chunk[1]
-                api_key = chunk[2] or os.getenv(f"{provider.upper()}_API_KEY")
+                api_key = chunk[2] or os.getenv(f"{provider.upper()}_API_KEY", "")
                 if not api_key:
                     raise gr.Error(f"API Key for {provider} (Adversary {i + 1}) is missing.")
+
                 adv_llm_cfg = LLMConfig(
-                    provider=provider, api_key=api_key, model_name=chunk[3], temperature=chunk[4]
+                    provider=provider,
+                    api_key=api_key,
+                    model_name=chunk[3],
+                    temperature=chunk[4],
+                    max_tokens=chunk[5]
                 )
                 adversary_cfgs.append(PersonaConfig(persona_name=chunk[0], llm_config=adv_llm_cfg))
 
@@ -74,7 +82,7 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
 
         v1_proposal_content, critiques_json, final_synthesis_content, history_md = "", "", "", ""
 
-        async for state in graph.astream(initial_state, {"recursion_limit": 10}):
+        async for state in graph.astream(initial_state, {"recursion_limit": 15}):
             if "propose" in state:
                 progress(0.3, desc="Stage 1: Proposal received.")
                 v1_proposal_content = state["propose"]["v1_proposal"].content
@@ -82,8 +90,9 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
 
             if "adversarial_analysis" in state:
                 progress(0.6, desc="Stage 2: Adversarial analysis complete.")
-                if state["adversarial_analysis"]["critiques_collection"]:
-                    critiques_json = state["adversarial_analysis"]["critiques_collection"].json(indent=2)
+                critiques = state["adversarial_analysis"].get("critiques_collection")
+                if critiques and critiques.critiques:
+                    critiques_json = critiques.model_dump_json(indent=2)
                 else:
                     critiques_json = '{"critiques": []}'
                 yield v1_proposal_content, critiques_json, final_synthesis_content, history_md
@@ -112,9 +121,10 @@ def create_persona_ui(persona_name, is_adversary=False):
             )
 
         provider = gr.Dropdown(label="LLM Provider", choices=list(MODEL_ZOO.keys()), value="OpenAI")
-        model = gr.Dropdown(label="Model Name", choices=MODEL_ZOO[provider.value], value=MODEL_ZOO[provider.value][0])
+        model = gr.Dropdown(label="Model Name", choices=MODEL_ZOO["OpenAI"], value=MODEL_ZOO["OpenAI"][0])
         api_key = gr.Textbox(label="API Key", type="password", placeholder="Leave blank to use .env")
         temp = gr.Slider(label="Temperature", minimum=0.0, maximum=1.5, step=0.1, value=0.1)
+        max_tokens = gr.Slider(label="Max Tokens (Budget Limiter)", minimum=500, maximum=16000, step=500, value=4000)
 
         def update_models(prov):
             choices = MODEL_ZOO.get(prov, [])
@@ -130,21 +140,23 @@ def create_persona_ui(persona_name, is_adversary=False):
                     gr.update(disabled=disabled),
                     gr.update(disabled=disabled),
                     gr.update(disabled=disabled),
+                    gr.update(disabled=disabled)
                 )
 
             persona_selector.change(
                 fn=toggle_adversary_inputs,
                 inputs=persona_selector,
-                outputs=[provider, api_key, model, temp],
+                outputs=[provider, api_key, model, temp, max_tokens],
             )
-            return persona_selector, provider, api_key, model, temp
+            return persona_selector, provider, api_key, model, temp, max_tokens
         else:
-            return provider, api_key, model, temp
+            return provider, api_key, model, temp, max_tokens
 
 
 with gr.Blocks(theme=gr.themes.Soft(), title="MASC Advanced Agent") as app:
     gr.Markdown("# MASC: Advanced Workflow Designer")
     all_ui_inputs = []
+
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("## 1. Task Description")
@@ -164,7 +176,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Advanced Agent") as app:
                         label="Synthesis Protocol",
                         choices=['Sequential Refinement', 'Architect'],
                         value='Sequential Refinement',
-                        info="Choose the method for resolving critiques. 'Architect' is a placeholder."
+                        info="Choose 'Architect' for unified, holistic rewriting or 'Sequential' for line-item patching."
                     )
                     all_ui_inputs.append(synthesis_protocol_selector)
 

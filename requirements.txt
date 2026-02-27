@@ -1,8 +1,8 @@
-gradio==5.31.0
-langchain==0.3.0
-langgraph>=0.2.20,<0.3
-pydantic>=2.0.0,<3.0.0
-langchain-openai==0.2.0
-langchain-anthropic==0.2.0
-langchain-google-genai==2.0.0
-python-dotenv==1.0.1
+gradio>=5.31.0
+langchain>=0.3.15
+langgraph>=0.3.5
+pydantic>=2.9.0,<3.0.0
+langchain-openai>=0.2.10
+langchain-anthropic>=0.3.0
+langchain-google-genai>=2.0.5
+python-dotenv>=1.0.1
