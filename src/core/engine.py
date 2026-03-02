@@ -1,140 +1,49 @@
-import logging
 import asyncio
-from typing import List, Literal, Optional, TypedDict, Annotated
-from pydantic import BaseModel, Field
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable
-from langgraph.graph import END, StateGraph
+import logging
+import traceback
+from typing import AsyncGenerator, Optional, Literal
+
 from langchain.chat_models import init_chat_model
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.graph import END, StateGraph
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from src.config.settings import settings
+from src.core.personas import ADVERSARY_PERSONAS
+from src.core.state import MASCState, MASCConfig, PersonaConfig, Artifact, CritiquesCollection, Critique
 
-
-class LLMConfig(BaseModel):
-    provider: Literal["OpenAI", "Anthropic", "Google"]
-    api_key: str = Field(..., repr=False)
-    model_name: str
-    temperature: float = 0.1
-    max_tokens: int = Field(default=4096, description="Budget limiter to prevent runaway token usage.")
-
-    model_config = {"arbitrary_types_allowed": True}
-
-
-class PersonaConfig(BaseModel):
-    persona_name: str
-    llm_config: LLMConfig
-
-    model_config = {"arbitrary_types_allowed": True}
-
-
-class MASCConfig(BaseModel):
-    proposer: PersonaConfig
-    synthesizer: PersonaConfig
-    adversaries: List[PersonaConfig]
-    synthesis_protocol: Literal['Sequential Refinement', 'Architect'] = 'Sequential Refinement'
-
-    model_config = {"arbitrary_types_allowed": True}
-
-
-class Artifact(BaseModel):
-    version: str
-    content: str
-    history: list[str] = Field(default_factory=list)
-
-    model_config = {"arbitrary_types_allowed": True}
-
-
-class Critique(BaseModel):
-    source_adversary: str = Field(description="The name of the adversary generating this critique.")
-    critique_type: Literal["CONSTRUCTIVE", "ANTAGONISTIC"] = Field(description="The nature of the critique.")
-    payload: Annotated[List[dict], Field(min_items=1)] = Field(description="A list of specific issues identified.")
-
-    model_config = {"arbitrary_types_allowed": True}
-
-
-class CritiquesCollection(BaseModel):
-    critiques: List[Critique]
-
-    model_config = {"arbitrary_types_allowed": True}
-
-
-class MASCState(TypedDict):
-    task_description: str
-    config: MASCConfig
-    v1_proposal: Artifact
-    critiques_collection: Optional[CritiquesCollection]
-    final_synthesis: Optional[Artifact]
-
-
-ADVERSARY_PERSONAS = {
-    "UncertaintyQuantifier": {
-        "critique_type": "CONSTRUCTIVE",
-        "system_prompt": "Assume the role of The Uncertainty Quantifier. Your sole function is to perform a rigorous "
-                         "epistemic audit of the provided text. Your analysis checklist includes: Unsubstantiated Claims,"
-                         " Ambiguous Terminology, Unstated Assumptions, Overconfident Extrapolation, and Neglect of Contested Knowledge."
-                         " Critique the following artifact. Provide your output as a list of dictionary objects with 'severity', 'description',"
-                         " and 'recommendation' keys."
-    },
-    "ContextualChallenger": {
-        "critique_type": "CONSTRUCTIVE",
-        "system_prompt": "Assume the role of The Contextual Challenger. Your function is to analyze the provided text"
-                         " for its contextual blind spots. Your analysis checklist includes: Stakeholder Omissions,"
-                         " Ethical and Moral Blind Spots, Cross-Domain Myopia, Implementation and Practicality Barriers,"
-                         " and Potential for Misuse. Critique the following artifact. Provide your output as a list of"
-                         " dictionary objects with 'severity', 'description', and 'recommendation' keys."
-    },
-    "DA": {
-        "critique_type": "ANTAGONISTIC",
-        "system_prompt": "Assume the role of The Devil's Advocate. Your function is not to provide constructive feedback. "
-                         "Your task is to be a pure antagonist. Identify the central thesis of the provided text and "
-                         "formulate the strongest possible counter-argument, even if that argument is specious or contrarian. "
-                         "Your goal is to force a defense of the proposal's most fundamental assumptions. Do not offer solutions. "
-                         "Your output is designed to be refuted, not integrated. Critique the following artifact. "
-                         "Provide your output as a list of dictionary objects with 'severity' (always 'HIGH'), 'description' "
-                         "(the counter-argument), and 'recommendation' (always 'Refute this ideological challenge.')."
-    },
-    "CodeAuditor": {
-        "critique_type": "CONSTRUCTIVE",
-        "system_prompt": "Assume the role of an expert Code Auditor. Your function is to perform a security and quality "
-                         "audit of the provided source code. Your analysis checklist includes: Security Vulnerabilities "
-                         "(SQL Injection, XSS, etc.), Performance Bottlenecks, Readability, Maintainability, Error Handling,"
-                         " and adherence to Best Practices. Critique the following code artifact. Provide your output as a list of "
-                         "dictionary objects with 'severity' ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW'), 'description', and 'recommendation' keys."
-    }
-}
+logger = logging.getLogger(__name__)
 
 
 class MASCNodes:
-    def _get_llm(self, llm_config: LLMConfig) -> Runnable:
-        """Dynamically loads any LangChain supported model to ensure strict provider agnosticism."""
-        provider_mapping = {
-            "OpenAI": "openai",
-            "Anthropic": "anthropic",
-            "Google": "google_genai"
-        }
+    def __init__(self, sys_settings):
+        self.settings = sys_settings
 
-        provider_str = provider_mapping.get(llm_config.provider)
+    def _get_llm(self, config: PersonaConfig):
+        provider_mapping = {"OpenAI": "openai", "Anthropic": "anthropic", "Google": "google_genai"}
+        provider_str = provider_mapping.get(config.llm_config.provider)
         if not provider_str:
-            raise ValueError(f"Unsupported LLM Provider: {llm_config.provider}")
+            raise ValueError(f"Unsupported LLM Provider: {config.llm_config.provider}")
 
-        retry_config = {"stop_after_attempt": 3, "wait_exponential_jitter": False}
+        retry_config = {"stop_after_attempt": self.settings.llm_retry_attempts, "wait_exponential_jitter": False}
 
         return init_chat_model(
-            model=llm_config.model_name,
+            model=config.llm_config.model_name,
             model_provider=provider_str,
-            temperature=llm_config.temperature,
-            max_tokens=llm_config.max_tokens,
-            api_key=llm_config.api_key
+            temperature=config.llm_config.temperature,
+            max_tokens=config.llm_config.max_tokens,
+            api_key=config.llm_config.api_key
         ).with_retry(**retry_config)
 
     async def propose(self, state: MASCState) -> dict:
-        logging.info("Entering Proposer Node")
+        logger.info("Entering Proposer Node")
         config = state['config'].proposer
-        llm = self._get_llm(config.llm_config)
+        llm = self._get_llm(config)
 
         prompt = ChatPromptTemplate.from_messages([
             ("system",
-             f"You are an expert {config.persona_name}. Your task is to generate a comprehensive, well-structured, and well-supported initial response to the user's query. Build the strongest possible initial case."),
+             f"You are an expert {config.persona_name}. Your task is to generate a comprehensive, well-structured, and "
+             f"well-supported initial response to the user's query. Build the strongest possible initial case."),
             ("human", "{task_description}")
         ])
 
@@ -148,7 +57,7 @@ class MASCNodes:
         )}
 
     async def adversarial_analysis(self, state: MASCState) -> dict:
-        logging.info("Entering Adversarial Analysis Node")
+        logger.info("Entering Adversarial Analysis Node")
         v1_proposal_content = state['v1_proposal'].content
         adversary_configs = state['config'].adversaries
 
@@ -165,13 +74,13 @@ class MASCNodes:
             if isinstance(res, Critique):
                 valid_critiques.append(res)
             elif isinstance(res, Exception):
-                logging.error(f"Adversary task failed with exception: {res}")
+                logger.error(f"Adversary task failed with exception: {res}\n{traceback.format_exc()}")
 
         return {"critiques_collection": CritiquesCollection(critiques=valid_critiques)}
 
     async def _run_single_adversary(self, adv_config: PersonaConfig, name: str, content: str) -> Optional[Critique]:
         try:
-            llm = self._get_llm(adv_config.llm_config)
+            llm = self._get_llm(adv_config)
             persona = ADVERSARY_PERSONAS[name]
             structured_llm = llm.with_structured_output(Critique)
 
@@ -181,21 +90,19 @@ class MASCNodes:
             ])
 
             chain = prompt | structured_llm
-
-            logging.info(f"Running adversary: {name}")
+            logger.info(f"Running adversary: {name}")
 
             result = await chain.ainvoke({"artifact_content": content})
-            logging.info(f"Successfully generated critique from {name}")
+            logger.info(f"Successfully generated critique from {name}")
             return result
-
         except Exception as e:
-            logging.error(f"Adversary '{name}' failed. Error: {e}")
+            logger.error(f"Adversary '{name}' failed. Error: {e}")
             raise e
 
     async def triage_critiques(self, state: MASCState) -> dict:
-        logging.info("Entering Triage Node (for Sequential Refinement)")
+        logger.info("Entering Triage Node (for Sequential Refinement)")
         config = state['config'].synthesizer
-        llm = self._get_llm(config.llm_config)
+        llm = self._get_llm(config)
 
         critiques_json = state['critiques_collection'].model_dump_json(indent=2)
         task_description = state['task_description']
@@ -210,20 +117,20 @@ class MASCNodes:
         ])
 
         triage_chain = prompt | llm.with_structured_output(CritiquesCollection)
-        logging.info("Re-ordering critiques for optimal refinement...")
+        logger.info("Re-ordering critiques for optimal refinement...")
 
         sorted_critiques_collection = await triage_chain.ainvoke({
             "task_description": task_description,
             "critiques_json": critiques_json
         })
 
-        logging.info("Triage complete. New processing order established.")
+        logger.info("Triage complete. New processing order established.")
         return {"critiques_collection": sorted_critiques_collection}
 
     async def synthesize_sequential(self, state: MASCState) -> dict:
-        logging.info("Entering Synthesizer Node (Sequential Refinement)")
+        logger.info("Entering Synthesizer Node (Sequential Refinement)")
         config = state['config'].synthesizer
-        llm = self._get_llm(config.llm_config)
+        llm = self._get_llm(config)
 
         current_artifact = state['v1_proposal'].model_copy(deep=True)
         history_log = current_artifact.history.copy()
@@ -231,7 +138,7 @@ class MASCNodes:
         for critique in state['critiques_collection'].critiques:
             try:
                 if critique.critique_type == 'ANTAGONISTIC':
-                    logging.info(f"Refuting antagonistic critique from {critique.source_adversary}")
+                    logger.info(f"Refuting antagonistic critique from {critique.source_adversary}")
                     refutation_prompt = ChatPromptTemplate.from_messages([
                         ("system",
                          "You are a Master Synthesizer. Your task is to harden an original proposal against this cynical, "
@@ -251,7 +158,7 @@ class MASCNodes:
 
                 elif critique.critique_type == 'CONSTRUCTIVE':
                     for issue in critique.payload:
-                        logging.info(
+                        logger.info(
                             f"Addressing constructive issue from {critique.source_adversary}: {issue.get('description', 'N/A')}")
                         revision_prompt = ChatPromptTemplate.from_messages([
                             ("system",
@@ -270,7 +177,7 @@ class MASCNodes:
                         history_log.append(
                             f"Applied fix for critique: '{issue.get('description')}' from {critique.source_adversary}.")
             except Exception as e:
-                logging.error(
+                logger.error(
                     f"Failed to process critique from {critique.source_adversary}. Error: {e}. Skipping to next critique.")
                 history_log.append(
                     f"ERROR: Failed to apply fix for critique from {critique.source_adversary}. See logs for details.")
@@ -279,9 +186,9 @@ class MASCNodes:
         return {"final_synthesis": final_artifact}
 
     async def synthesize_architect(self, state: MASCState) -> dict:
-        logging.info("Entering Synthesizer Node (Architect Protocol)")
+        logger.info("Entering Synthesizer Node (Architect Protocol)")
         config = state['config'].synthesizer
-        llm = self._get_llm(config.llm_config)
+        llm = self._get_llm(config)
 
         v1_proposal = state['v1_proposal']
         critiques_collection = state['critiques_collection']
@@ -314,15 +221,15 @@ class MASCNodes:
 
 def should_route_to_synthesis(state: MASCState) -> Literal["triage_critiques", "synthesize_architect"]:
     protocol = state['config'].synthesis_protocol
-    logging.info(f"Routing to synthesis protocol: {protocol}")
+    logger.info(f"Routing to synthesis protocol: {protocol}")
     if protocol == 'Architect':
         return "synthesize_architect"
     return "triage_critiques"
 
 
-def create_masc_t_graph():
-    """Builds the MASC-T graph with conditional routing for synthesis protocols."""
-    nodes = MASCNodes()
+def build_masc_graph(checkpointer) -> StateGraph:
+    """Builds the MASC-T graph, dynamically binding it to the provided PostgreSQL checkpointer."""
+    nodes = MASCNodes(settings)
     graph_builder = StateGraph(MASCState)
 
     graph_builder.add_node("propose", nodes.propose)
@@ -347,4 +254,25 @@ def create_masc_t_graph():
     graph_builder.add_edge("synthesize_sequential", END)
     graph_builder.add_edge("synthesize_architect", END)
 
-    return graph_builder.compile()
+    return graph_builder.compile(checkpointer=checkpointer)
+
+
+async def execute_masc_workflow(task: str, config: MASCConfig, thread_id: str) -> AsyncGenerator[dict, None]:
+    """
+    Executes the workflow. The AsyncPostgresSaver handles connection pooling internally
+    and guarantees state is flushed to the database between every node transition.
+    """
+    if not settings.database_url.startswith("postgres"):
+        raise ValueError("Enterprise mode requires a valid PostgreSQL DATABASE_URL in settings.")
+
+    async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
+
+        await checkpointer.setup()
+
+        graph = build_masc_graph(checkpointer=checkpointer)
+        initial_state = {"task_description": task, "config": config}
+
+        run_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.max_recursion_depth}
+
+        async for state in graph.astream(initial_state, run_config):
+            yield state
