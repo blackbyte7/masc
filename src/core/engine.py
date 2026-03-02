@@ -5,6 +5,7 @@ from typing import AsyncGenerator, Optional, Literal
 
 from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, StateGraph
 
@@ -20,10 +21,24 @@ class MASCNodes:
         self.settings = sys_settings
 
     def _get_llm(self, config: PersonaConfig):
+        provider = config.llm_config.provider
+
+        if provider == "Ollama":
+            try:
+                from langchain_ollama import ChatOllama
+            except ImportError:
+                raise ImportError("Please run: pip install langchain-ollama")
+
+            return ChatOllama(
+                model=config.llm_config.model_name,
+                base_url=config.llm_config.base_url or "http://localhost:11434",
+                temperature=config.llm_config.temperature,
+            )
+
         provider_mapping = {"OpenAI": "openai", "Anthropic": "anthropic", "Google": "google_genai"}
-        provider_str = provider_mapping.get(config.llm_config.provider)
+        provider_str = provider_mapping.get(provider)
         if not provider_str:
-            raise ValueError(f"Unsupported LLM Provider: {config.llm_config.provider}")
+            raise ValueError(f"Unsupported LLM Provider: {provider}")
 
         retry_config = {"stop_after_attempt": self.settings.llm_retry_attempts, "wait_exponential_jitter": False}
 
@@ -32,7 +47,8 @@ class MASCNodes:
             model_provider=provider_str,
             temperature=config.llm_config.temperature,
             max_tokens=config.llm_config.max_tokens,
-            api_key=config.llm_config.api_key
+            api_key=config.llm_config.api_key or None,
+            base_url=config.llm_config.base_url or None
         ).with_retry(**retry_config)
 
     async def propose(self, state: MASCState) -> dict:
@@ -50,19 +66,22 @@ class MASCNodes:
         chain = prompt | llm
         response = await chain.ainvoke({"task_description": state['task_description']})
 
-        return {"v1_proposal": Artifact(
-            version="1.0_proposal",
-            content=response.content,
-            history=[f"Initial proposal by {config.persona_name} using {config.llm_config.model_name}"]
-        )}
+        return {
+            "current_artifact": Artifact(
+                version="1.0_proposal",
+                content=response.content,
+                history=[f"Initial proposal by {config.persona_name} using {config.llm_config.model_name}"]
+            ),
+            "current_turn": 1
+        }
 
     async def adversarial_analysis(self, state: MASCState) -> dict:
-        logger.info("Entering Adversarial Analysis Node")
-        v1_proposal_content = state['v1_proposal'].content
+        logger.info(f"Entering Adversarial Analysis Node (Turn {state.get('current_turn', 1)})")
+        current_content = state['current_artifact'].content
         adversary_configs = state['config'].adversaries
 
         critique_tasks = [
-            self._run_single_adversary(adv_config, adv_config.persona_name, v1_proposal_content)
+            self._run_single_adversary(adv_config, adv_config.persona_name, current_content)
             for adv_config in adversary_configs
             if adv_config.persona_name in ADVERSARY_PERSONAS
         ]
@@ -132,8 +151,9 @@ class MASCNodes:
         config = state['config'].synthesizer
         llm = self._get_llm(config)
 
-        current_artifact = state['v1_proposal'].model_copy(deep=True)
+        current_artifact = state['current_artifact'].model_copy(deep=True)
         history_log = current_artifact.history.copy()
+        current_turn = state.get("current_turn", 1)
 
         for critique in state['critiques_collection'].critiques:
             try:
@@ -154,7 +174,7 @@ class MASCNodes:
                         "ant_critique": critique.model_dump_json()
                     })
                     current_artifact.content = response.content
-                    history_log.append(f"Hardened proposal against critique from: {critique.source_adversary}")
+                    history_log.append(f"[Turn {current_turn}] Hardened against: {critique.source_adversary}")
 
                 elif critique.critique_type == 'CONSTRUCTIVE':
                     for issue in critique.payload:
@@ -175,27 +195,28 @@ class MASCNodes:
                         })
                         current_artifact.content = response.content
                         history_log.append(
-                            f"Applied fix for critique: '{issue.get('description')}' from {critique.source_adversary}.")
+                            f"[Turn {current_turn}] Fixed critique: '{issue.get('description')}' from {critique.source_adversary}.")
             except Exception as e:
-                logger.error(
-                    f"Failed to process critique from {critique.source_adversary}. Error: {e}. Skipping to next critique.")
+                logger.error(f"Failed to process critique from {critique.source_adversary}. Error: {e}")
                 history_log.append(
-                    f"ERROR: Failed to apply fix for critique from {critique.source_adversary}. See logs for details.")
+                    f"[Turn {current_turn}] ERROR: Failed to apply fix for critique from {critique.source_adversary}.")
 
-        final_artifact = Artifact(version="2.0_final_sequential", content=current_artifact.content, history=history_log)
-        return {"final_synthesis": final_artifact}
+        final_artifact = Artifact(version=f"{current_turn + 1}.0_sequential", content=current_artifact.content,
+                                  history=history_log)
+        return {"current_artifact": final_artifact, "current_turn": current_turn + 1}
 
     async def synthesize_architect(self, state: MASCState) -> dict:
         logger.info("Entering Synthesizer Node (Architect Protocol)")
         config = state['config'].synthesizer
         llm = self._get_llm(config)
 
-        v1_proposal = state['v1_proposal']
+        current_artifact = state['current_artifact']
         critiques_collection = state['critiques_collection']
+        current_turn = state.get("current_turn", 1)
 
-        history_log = v1_proposal.history.copy()
-        history_log.append("Architect synthesis protocol selected. Executing holistic review.")
-        history_log.append(f"Received {len(critiques_collection.critiques)} critiques for holistic review.")
+        history_log = current_artifact.history.copy()
+        history_log.append(
+            f"[Turn {current_turn}] Architect holistic review of {len(critiques_collection.critiques)} critiques.")
 
         architect_prompt = ChatPromptTemplate.from_messages([
             ("system",
@@ -209,14 +230,15 @@ class MASCNodes:
 
         architect_chain = architect_prompt | llm
         response = await architect_chain.ainvoke({
-            "proposal": v1_proposal.content,
+            "proposal": current_artifact.content,
             "critiques": critiques_collection.model_dump_json(indent=2)
         })
 
-        history_log.append("Architect successfully unified critiques into a final hardened artifact.")
-        final_artifact = Artifact(version="2.0_final_architect", content=response.content, history=history_log)
+        history_log.append(f"[Turn {current_turn}] Architect unified critiques into a hardened artifact.")
+        final_artifact = Artifact(version=f"{current_turn + 1}.0_architect", content=response.content,
+                                  history=history_log)
 
-        return {"final_synthesis": final_artifact}
+        return {"current_artifact": final_artifact, "current_turn": current_turn + 1}
 
 
 def should_route_to_synthesis(state: MASCState) -> Literal["triage_critiques", "synthesize_architect"]:
@@ -225,6 +247,15 @@ def should_route_to_synthesis(state: MASCState) -> Literal["triage_critiques", "
     if protocol == 'Architect':
         return "synthesize_architect"
     return "triage_critiques"
+
+
+def should_continue_loop(state: MASCState) -> Literal["adversarial_analysis", "__end__"]:
+    # The turn was already incremented inside the synthesis nodes
+    if state["current_turn"] <= state["config"].max_turns:
+        logger.info(f"Looping back for Turn {state['current_turn']} / {state['config'].max_turns}")
+        return "adversarial_analysis"
+    logger.info("Max turns reached. Ending workflow.")
+    return "__end__"
 
 
 def build_masc_graph(checkpointer) -> StateGraph:
@@ -251,8 +282,12 @@ def build_masc_graph(checkpointer) -> StateGraph:
     )
 
     graph_builder.add_edge("triage_critiques", "synthesize_sequential")
-    graph_builder.add_edge("synthesize_sequential", END)
-    graph_builder.add_edge("synthesize_architect", END)
+
+    # Cyclic routing
+    graph_builder.add_conditional_edges("synthesize_sequential", should_continue_loop,
+                                        {"adversarial_analysis": "adversarial_analysis", "__end__": END})
+    graph_builder.add_conditional_edges("synthesize_architect", should_continue_loop,
+                                        {"adversarial_analysis": "adversarial_analysis", "__end__": END})
 
     return graph_builder.compile(checkpointer=checkpointer)
 
@@ -262,17 +297,18 @@ async def execute_masc_workflow(task: str, config: MASCConfig, thread_id: str) -
     Executes the workflow. The AsyncPostgresSaver handles connection pooling internally
     and guarantees state is flushed to the database between every node transition.
     """
-    if not settings.database_url.startswith("postgres"):
-        raise ValueError("Enterprise mode requires a valid PostgreSQL DATABASE_URL in settings.")
+    initial_state = {"task_description": task, "config": config, "current_turn": 1}
+    run_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.max_recursion_depth}
 
-    async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
-
-        await checkpointer.setup()
-
+    if settings.database_url.startswith("postgres"):
+        async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
+            await checkpointer.setup()
+            graph = build_masc_graph(checkpointer=checkpointer)
+            async for state in graph.astream(initial_state, run_config):
+                yield state
+    else:
+        logger.warning("No Postgres URL found. Using in-memory checkpointer (State will not persist after execution).")
+        checkpointer = MemorySaver()
         graph = build_masc_graph(checkpointer=checkpointer)
-        initial_state = {"task_description": task, "config": config}
-
-        run_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.max_recursion_depth}
-
         async for state in graph.astream(initial_state, run_config):
             yield state

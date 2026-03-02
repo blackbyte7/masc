@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description="MASC Enterprise Framework Launcher")
     parser.add_argument(
         "--mode",
-        choices=["ui", "api", "cli"],
+        choices=["ui", "api", "cli", "mcp"],
         default="ui",
         help="Choose which interface to launch (default: ui)"
     )
@@ -32,9 +32,13 @@ def main():
     elif args.mode == "cli":
         logging.info("🚀 Delegating to MASC CLI...")
         from src.entrypoints.cli import main as cli_main
-        # Re-map sys.argv so the CLI parser only sees its own specific arguments
         sys.argv = [sys.argv[0]] + unknown
         cli_main()
+
+    elif args.mode == "mcp":
+        logging.info("🚀 Launching MASC MCP Server for Agentic Workflows...")
+        from src.entrypoints.mcp_server import mcp
+        mcp.run()
 
 
 if __name__ == "__main__":

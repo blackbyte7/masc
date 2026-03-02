@@ -18,7 +18,8 @@ def generate_template(filepath: str):
         proposer=PersonaConfig(persona_name="Proposer", llm_config=default_llm),
         synthesizer=PersonaConfig(persona_name="Synthesizer", llm_config=default_llm),
         adversaries=[PersonaConfig(persona_name="DA", llm_config=default_llm)],
-        synthesis_protocol="Sequential Refinement"
+        synthesis_protocol="Sequential Refinement",
+        max_turns=2  # Added max_turns to the template
     )
 
     with open(filepath, 'w') as f:
@@ -42,20 +43,28 @@ async def run_cli(task: str, config_path: str):
     print(f"Task: {task}")
     print(f"Thread ID: {thread_id}")
     print(f"Synthesis Protocol: {config.synthesis_protocol}")
+    print(f"Max Cycles: {config.max_turns}")
     print("-" * 50)
 
     try:
+        final_content = ""
         async for state in execute_masc_workflow(task, config, thread_id):
             step_name = list(state.keys())[0]
-            print(f"🔄 Executed Node: [ {step_name.upper()} ]")
+            node_state = state[step_name]
 
-            if step_name == "synthesize_sequential" or step_name == "synthesize_architect":
-                final_content = state[step_name]["final_synthesis"].content
-                print("\n" + "=" * 50)
-                print("🎯 FINAL SYNTHESIS ARTIFACT")
-                print("=" * 50)
-                print(final_content)
-                print("\n✅ Workflow Completed Successfully.")
+            # Extract current turn if available
+            current_turn = node_state.get("current_turn", "?")
+
+            print(f"🔄 [Turn {current_turn}] Executed Node: [ {step_name.upper()} ]")
+
+            if step_name in ["synthesize_sequential", "synthesize_architect"]:
+                final_content = node_state["current_artifact"].content
+
+        print("\n" + "=" * 50)
+        print("🎯 FINAL SYNTHESIS ARTIFACT")
+        print("=" * 50)
+        print(final_content)
+        print("\n✅ Workflow Completed Successfully.")
 
     except Exception as e:
         print(f"\n❌ Execution Error: {e}")

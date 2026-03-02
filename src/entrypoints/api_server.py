@@ -23,7 +23,23 @@ class MASCRequest(BaseModel):
 async def stream_graph_execution(task_description: str, config: MASCConfig, thread_id: str):
     try:
         async for state_update in execute_masc_workflow(task_description, config, thread_id):
-            yield f"data: {json.dumps(str(state_update))}\n\n"
+            node_name = list(state_update.keys())[0]
+            node_data = state_update[node_name]
+
+            safe_state = {}
+            for key, value in node_data.items():
+                if hasattr(value, "model_dump"):
+                    safe_state[key] = value.model_dump()
+                else:
+                    safe_state[key] = value
+
+            payload = {
+                "node_executed": node_name,
+                "current_turn": node_data.get("current_turn", 1),
+                "state_data": safe_state
+            }
+
+            yield f"data: {json.dumps(payload)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as e:
         yield f"data: {json.dumps({'error': str(e)})}\n\n"

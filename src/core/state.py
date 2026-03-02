@@ -4,8 +4,9 @@ from pydantic import BaseModel, Field
 
 
 class LLMConfig(BaseModel):
-    provider: Literal["OpenAI", "Anthropic", "Google"]
-    api_key: str = Field(..., repr=False)
+    provider: Literal["OpenAI", "Anthropic", "Google", "Ollama"]
+    api_key: str = Field(default="", repr=False)
+    base_url: Optional[str] = Field(default=None, description="Custom local URL (e.g., http://localhost:11434)")
     model_name: str
     temperature: float = 0.1
     max_tokens: int = Field(default=4096, description="Budget limiter to prevent runaway token usage.")
@@ -21,6 +22,7 @@ class MASCConfig(BaseModel):
     synthesizer: PersonaConfig
     adversaries: List[PersonaConfig]
     synthesis_protocol: Literal['Sequential Refinement', 'Architect'] = 'Sequential Refinement'
+    max_turns: int = Field(default=1, ge=1, description="Number of critique-synthesis cycles to execute.")
 
 
 class Artifact(BaseModel):
@@ -42,6 +44,6 @@ class CritiquesCollection(BaseModel):
 class MASCState(TypedDict):
     task_description: str
     config: MASCConfig
-    v1_proposal: Artifact
+    current_artifact: Artifact
     critiques_collection: Optional[CritiquesCollection]
-    final_synthesis: Optional[Artifact]
+    current_turn: int
