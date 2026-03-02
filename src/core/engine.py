@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import traceback
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional, Literal
 
 from langchain.chat_models import init_chat_model
@@ -8,13 +9,40 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, StateGraph
-
+from langgraph.graph.state import CompiledStateGraph
+from psycopg_pool import AsyncConnectionPool
 
 from src.config.settings import settings
 from src.core.personas import ADVERSARY_PERSONAS
 from src.core.state import MASCState, MASCConfig, PersonaConfig, Artifact, CritiquesCollection, Critique
 
 logger = logging.getLogger(__name__)
+
+_pg_pool: Optional[AsyncConnectionPool] = None
+
+
+@asynccontextmanager
+async def get_checkpointer():
+    """Provides a managed checkpointer using a global connection pool."""
+    global _pg_pool
+
+    if settings.database_url.startswith("postgres"):
+        if _pg_pool is None:
+            logger.info("Initializing global PostgreSQL connection pool...")
+            _pg_pool = AsyncConnectionPool(
+                conninfo=settings.database_url,
+                max_size=20,
+                kwargs={"autocommit": True, "prepare_threshold": 0}
+            )
+            # Wait for the pool to connect successfully
+            await _pg_pool.open()
+
+        checkpointer = AsyncPostgresSaver(_pg_pool)
+        await checkpointer.setup()
+        yield checkpointer
+    else:
+        logger.warning("No Postgres URL found. Using ephemeral in-memory checkpointer.")
+        yield MemorySaver()
 
 
 class MASCNodes:
@@ -225,8 +253,7 @@ class MASCNodes:
              "Your task is to analyze all critiques simultaneously, resolve conflicting advice, and rewrite the proposal from the ground up "
              "to create a single, unified, and hardened final document. Ensure all valid concerns are integrated organically, "
              "rather than patched on sequentially."),
-            ("human",
-             "Initial Proposal:\n{proposal}\n\nAdversarial Critiques:\n{critiques}")
+            ("human", "Initial Proposal:\n{proposal}\n\nAdversarial Critiques:\n{critiques}")
         ])
 
         architect_chain = architect_prompt | llm
@@ -236,8 +263,7 @@ class MASCNodes:
         })
 
         history_log.append(f"[Turn {current_turn}] Architect unified critiques into a hardened artifact.")
-        final_artifact = Artifact(version=f"{current_turn + 1}.0_architect", content=response.content,
-                                  history=history_log)
+        final_artifact = Artifact(version=f"{current_turn + 1}.0_architect", content=response.content, history=history_log)
 
         return {"current_artifact": final_artifact, "current_turn": current_turn + 1}
 
@@ -251,7 +277,6 @@ def should_route_to_synthesis(state: MASCState) -> Literal["triage_critiques", "
 
 
 def should_continue_loop(state: MASCState) -> Literal["adversarial_analysis", "__end__"]:
-    # The turn was already incremented inside the synthesis nodes
     if state["current_turn"] <= state["config"].max_turns:
         logger.info(f"Looping back for Turn {state['current_turn']} / {state['config'].max_turns}")
         return "adversarial_analysis"
@@ -260,7 +285,7 @@ def should_continue_loop(state: MASCState) -> Literal["adversarial_analysis", "_
 
 
 def build_masc_graph(checkpointer) -> CompiledStateGraph:
-    """Builds the MASC graph, dynamically binding it to the provided PostgreSQL checkpointer."""
+    """Builds the MASC graph, dynamically binding it to the provided checkpointer."""
     nodes = MASCNodes(settings)
     graph_builder = StateGraph(MASCState)
 
@@ -295,13 +320,11 @@ def build_masc_graph(checkpointer) -> CompiledStateGraph:
 
 async def execute_masc_workflow(task: str, config: MASCConfig, thread_id: str) -> AsyncGenerator[dict, None]:
     """
-    Executes the workflow. The AsyncPostgresSaver handles connection pooling internally
-    and guarantees state is flushed to the database between every node transition.
+    Executes the workflow. The checkpointer is managed safely via the global pool.
     """
     initial_state = {"task_description": task, "config": config, "current_turn": 1}
     run_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.max_recursion_depth}
 
-    # Inject Langfuse Callbacks if configured in the environment
     if settings.langfuse_public_key and settings.langfuse_secret_key:
         try:
             from langfuse.callback import CallbackHandler
@@ -315,15 +338,7 @@ async def execute_masc_workflow(task: str, config: MASCConfig, thread_id: str) -
         except ImportError:
             logger.warning("Langfuse keys found, but langfuse package is not installed. Run 'pip install langfuse'.")
 
-    if settings.database_url.startswith("postgres"):
-        async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
-            await checkpointer.setup()
-            graph = build_masc_graph(checkpointer=checkpointer)
-            async for state in graph.astream(initial_state, run_config):
-                yield state
-    else:
-        logger.warning("No Postgres URL found. Using in-memory checkpointer (State will not persist after execution).")
-        checkpointer = MemorySaver()
+    async with get_checkpointer() as checkpointer:
         graph = build_masc_graph(checkpointer=checkpointer)
         async for state in graph.astream(initial_state, run_config):
             yield state

@@ -47,25 +47,18 @@ Whether generating code, strategic proposals, or analytical reports, MASC surrou
 
 ## 🛠️ Installation & Setup
 
-### 1. Prerequisites
-* Python 3.10 or higher.
-* API keys for your desired LLM providers (OpenAI, Anthropic, Google, etc.).
-* *(Optional)* A running PostgreSQL instance for state persistence.
-* *(Optional)* A Langfuse account for observability.
+MASC requires a PostgreSQL database for state persistence and several API keys for its modular adversaries. Docker is the recommended way to run the entire suite cleanly.
 
-### 2. Installation
-Clone the repository and install the dependencies:
-
+### 1. Clone the Repository
 ```bash
 git clone [https://github.com/your-username/masc.git](https://github.com/your-username/masc.git)
 cd masc
-pip install -r requirements.txt
 
 ```
 
-### 3. Environment Configuration
+### 2. Configure Environment Variables
 
-MASC uses `.env` files for secure credential management. Create a `.env` file in the root directory:
+Create a `.env` file in the root directory. MASC will automatically route to the correct provider based on your workflow configuration.
 
 ```env
 # -----------------------------
@@ -84,10 +77,19 @@ LANGFUSE_SECRET_KEY="sk-lf-..."
 LANGFUSE_HOST="[https://cloud.langfuse.com](https://cloud.langfuse.com)" 
 
 # -----------------------------
-# State Persistence (Optional)
+# State Persistence 
 # -----------------------------
-# Leave as sqlite:///masc_memory.db for local ephemeral testing
+# Required if running outside of Docker. Docker Compose handles this automatically.
 # DATABASE_URL="postgresql://user:password@localhost:5432/masc_db"
+
+```
+
+### 3. Build and Start the Infrastructure
+
+Spin up the database and the backend services in detached mode:
+
+```bash
+docker compose up -d
 
 ```
 
@@ -102,6 +104,7 @@ MASC uses a unified launcher (`main.py`) to expose its four distinct entrypoints
 The easiest way to interact with MASC, configure personas, and watch the dialectical process unfold in real-time.
 
 ```bash
+# If running locally without Docker:
 python main.py --mode ui
 
 ```
@@ -113,6 +116,7 @@ python main.py --mode ui
 Deploys a FastAPI instance capable of streaming graph execution states via Server-Sent Events (SSE). Ideal for integrating MASC into existing web applications.
 
 ```bash
+# If running locally without Docker:
 python main.py --mode api
 
 ```
@@ -137,44 +141,59 @@ python main.py --mode cli --task "Draft a migration strategy to microservices." 
 
 ```
 
-### 4. Model Context Protocol (MCP Mode)
+### 4. Model Context Protocol (MCP Mode) via Docker
 
-Expose MASC as a tool to external autonomous agents (like Claude Desktop or LangChain agents). The external agent provides the task and config, while MASC handles the internal multi-agent dialectic using its own environment credentials.
+You can expose MASC as a powerful, adversarial tool to external autonomous agents (like Claude Desktop, Cursor, or LangChain agents). Because MASC requires a database and complex dependencies, the cleanest way to connect it is by pointing your MCP client to the Docker container.
 
-```bash
-python main.py --mode mcp
-
-```
+The external agent provides the task and configuration, while the isolated container handles the multi-agent dialectic securely.
 
 **Adding to Claude Desktop (`claude_desktop_config.json`):**
+
+To connect Claude Desktop to your running MASC instance, add the following configuration. By using `docker compose run`, the MCP process automatically connects to the PostgreSQL database network and inherits your `.env` keys.
 
 ```json
 {
   "mcpServers": {
     "MASC-Dialectics": {
-      "command": "python",
-      "args": ["/path/to/masc/main.py", "--mode", "mcp"]
+      "command": "docker",
+      "args": [
+        "compose",
+        "-f",
+        "/absolute/path/to/masc/docker-compose.yml",
+        "run",
+        "--rm",
+        "-i",
+        "masc-api",
+        "python",
+        "main.py",
+        "--mode",
+        "mcp"
+      ]
     }
   }
 }
 
 ```
 
+*Note: Be sure to replace `/absolute/path/to/masc/docker-compose.yml` with the actual path to your cloned directory.*
+
 ---
 
 ## 🔬 Extending the Framework (Custom Personas)
 
-You can easily expand MASC's library of adversarial critics without modifying any Python code. 
+You can easily expand MASC's library of adversarial critics without modifying any Python code.
 
 To add custom personas, simply create a file named `custom_personas.json` in the root directory of the project (alongside `main.py`). When the application starts, it will automatically load these and merge them with the default personas. They will instantly appear in the Gradio UI dropdowns and be accessible via the CLI and MCP endpoints.
 
 ### File Format
 
 The JSON file must consist of a dictionary where the keys are the **Persona Names** (no spaces recommended) and the values are objects containing:
+
 * `critique_type`: Must be either `"CONSTRUCTIVE"` (aims to improve the artifact) or `"ANTAGONISTIC"` (aims to destroy the artifact's fundamental premise).
 * `system_prompt`: The detailed instructions for the LLM.
 
 **Example `custom_personas.json`:**
+
 ```json
 {
   "ComplianceOfficer": {

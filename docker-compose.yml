@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  masc-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://masc_user:masc_pass@postgres:5432/masc_db
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "main.py", "--mode", "api"]
+
+  masc-ui:
+    build: .
+    ports:
+      - "7860:7860"
+    environment:
+      - DATABASE_URL=postgresql://masc_user:masc_pass@postgres:5432/masc_db
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "main.py", "--mode", "ui"]
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=masc_user
+      - POSTGRES_PASSWORD=masc_pass
+      - POSTGRES_DB=masc_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U masc_user -d masc_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
