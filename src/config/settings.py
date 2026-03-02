@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,8 +18,13 @@ class MASCSettings(BaseSettings):
     # Resiliency
     llm_retry_attempts: int = Field(default=3, description="Number of retries for API failures.")
 
-    # Checkpointing / Persistence (Postgres connection string for LangGraph checkpointer)
+    # Checkpointing / Persistence
     database_url: str = Field(default="sqlite:///masc_memory.db", description="URI for state persistence.")
+
+    # Observability (Optional Langfuse Integration)
+    langfuse_secret_key: Optional[str] = Field(default=None, description="Langfuse Secret Key")
+    langfuse_public_key: Optional[str] = Field(default=None, description="Langfuse Public Key")
+    langfuse_host: str = Field(default="https://cloud.langfuse.com", description="Langfuse Host")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

@@ -52,7 +52,6 @@ async def run_cli(task: str, config_path: str):
             step_name = list(state.keys())[0]
             node_state = state[step_name]
 
-            # Extract current turn if available
             current_turn = node_state.get("current_turn", "?")
 
             print(f"🔄 [Turn {current_turn}] Executed Node: [ {step_name.upper()} ]")

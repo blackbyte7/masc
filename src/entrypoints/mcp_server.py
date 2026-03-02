@@ -31,7 +31,6 @@ async def trigger_masc_audit(task_description: str, config_json: str) -> str:
         if not final_state:
             return "Error: Workflow failed to produce any output."
 
-        # Extract the final synthesized artifact from whatever the last node was
         last_node_name = list(final_state.keys())[0]
         final_artifact = final_state[last_node_name].get("current_artifact")
 

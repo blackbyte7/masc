@@ -2,7 +2,7 @@
 
 # 🧠 MASC: Modular Adversarial Synergy Chain
 
-**Official (POC) Python implementation of the *Modular Adversarial Synergy Chain* architecture.**
+**A General-Purpose Dialectical and Adversarial Architecture for Autonomous Agentic AI Robustness.**
 
 </div>
 
@@ -11,113 +11,187 @@
     <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
   </a>
   <a href="https://www.python.org">
-    <img src="https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python" alt="Python 3.9+">
+    <img src="https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python" alt="Python 3.10+">
   </a>
-  <a href="https://python.langchain.com/v0.2/docs/langgraph/">
+  <a href="https://python.langchain.com/docs/langgraph/">
     <img src="https://img.shields.io/badge/Built%20with-LangGraph-229540.svg" alt="Built with LangGraph">
   </a>
+  <a href="https://langfuse.com/">
+    <img src="https://img.shields.io/badge/Observability-Langfuse-FF2D20.svg" alt="Langfuse Observability">
+  </a>
+  <a href="https://modelcontextprotocol.io/">
+    <img src="https://img.shields.io/badge/Protocol-MCP-8A2BE2.svg" alt="Model Context Protocol">
+  </a>
 </p>
-
 
 ---
 
 ## 📖 Overview
 
-This repository contains the official reference implementation for the MASC framework, as detailed in the white paper: *
-*"[MASC: A General-Purpose Dialectical and Adversarial Architecture for Autonomous Agentic Robustness](LINK_TO_YOUR_PAPER.pdf)"
-** by Alexander Schneider (Bielefeld, 2025).
+MASC (Modular Adversarial Synergy Chain) is an enterprise-grade framework designed to force AI-generated artifacts to withstand rigorous, multi-vector criticism before finalization. Moving beyond linear generation pipelines, MASC implements a structured, internal dialectical debate (Thesis -> Antithesis -> Synthesis).
 
-The project's goal is to provide a clear, functional, and extensible tool for exploring dialectical methods in AI
-quality assurance. It moves beyond linear generation pipelines to a model of structured, internal debate, forcing an
-AI-generated artifact to withstand multi-vector criticism before it is finalized.
+Whether generating code, strategic proposals, or analytical reports, MASC surrounds the initial generation with specialized adversarial agents (e.g., `CodeAuditor`, `Devil'sAdvocate`, `UncertaintyQuantifier`) that ruthlessly critique the artifact. A Synthesizer then rebuilds the artifact to patch vulnerabilities, optionally looping over multiple cycles to produce a highly robust, hardened final output.
+
+
 
 ## ✨ Key Features
 
-* **Dialectical Process:** Implements the core Thesis-Antithesis-Synthesis loop for systematic artifact hardening.
-* **Modular Personas:** A plug-and-play library of adversarial and constructive
-  critics (`CodeAuditor`, `Devil'sAdvocate`, etc.) allows the process to be tailored to any domain.
-* **Fine-Grained Control:** The UI allows for assigning specific LLM providers (OpenAI, Anthropic, Google), models, and
-  parameters to *each individual step* of the cognitive workflow.
-* **Streaming Interface:** The Gradio UI streams results in real-time, providing a transparent view into the agent's
-  multi-stage reasoning process as it happens.
-* **Modern Architecture:** Built from the ground up using the latest LangChain v0.2 standards, including LangGraph for
-  stateful agent execution.
+* **Dialectical Engine:** Implements a strict Propose ➔ Critique ➔ Synthesize cycle managed by LangGraph.
+* **Universal Entrypoints:** Access the engine via a rich Gradio UI, a FastAPI server, a CLI, or as a native **Model Context Protocol (MCP)** tool for external agentic workflows.
+* **Modular Personas:** A plug-and-play dictionary of specialized critics. Easily define custom adversaries to target domain-specific blind spots.
+* **Granular LLM Routing:** Mix and match providers (OpenAI, Anthropic, Google, local Ollama) on a per-node basis. Run the Proposer on Claude 3.5 Sonnet, the Adversaries on GPT-4o, and the Synthesizer on Llama-3.
+* **Production Observability:** Native, zero-config Langfuse integration for tracing node latency, token usage, and step-by-step reasoning.
+* **Enterprise State Management:** Built-in PostgreSQL checkpointer support for persistent state across complex, long-running graphs.
 
-## ⚙️ How It Works
+---
 
-The framework is implemented as a Directed Acyclic Graph (DAG) that manages the flow of information between specialized
-nodes. This graph structure is defined in `masc_t_engine_advanced.py` and orchestrated by LangGraph. The process follows
-four distinct stages: Propose, Adversarial Analysis, Synthesize, and producing the Final Artifact.
-
-## 🛠️ Getting Started
+## 🛠️ Installation & Setup
 
 ### 1. Prerequisites
-
-- Python 3.9 or higher.
-- API keys for the LLM providers you intend to use (OpenAI, Anthropic, Google).
+* Python 3.10 or higher.
+* API keys for your desired LLM providers (OpenAI, Anthropic, Google, etc.).
+* *(Optional)* A running PostgreSQL instance for state persistence.
+* *(Optional)* A Langfuse account for observability.
 
 ### 2. Installation
-
-First, clone the repository to your local machine:
+Clone the repository and install the dependencies:
 
 ```bash
-git clone https://github.com/blackbyte7/masc.git
-cd masc```
-
-Next, install the required Python packages:
-```bash
+git clone [https://github.com/your-username/masc.git](https://github.com/your-username/masc.git)
+cd masc
 pip install -r requirements.txt
-```
-
-### 3. Configuration
-
-For convenience, you can store your API keys in a `.env` file in the project's root directory. The application will load
-these automatically if the API key fields in the UI are left blank.
-
-Create a file named `.env`:
 
 ```
-OPENAI_API_KEY="sk-..."
+
+### 3. Environment Configuration
+
+MASC uses `.env` files for secure credential management. Create a `.env` file in the root directory:
+
+```env
+# -----------------------------
+# LLM Provider Keys
+# -----------------------------
+OPENAI_API_KEY="sk-proj-..."
 ANTHROPIC_API_KEY="sk-ant-..."
-GOOGLE_API_KEY="..."
+GOOGLE_API_KEY="AIza..."
+
+# -----------------------------
+# Observability (Optional)
+# -----------------------------
+LANGFUSE_PUBLIC_KEY="pk-lf-..."
+LANGFUSE_SECRET_KEY="sk-lf-..."
+# Use [https://us.cloud.langfuse.com](https://us.cloud.langfuse.com) if using US data residency
+LANGFUSE_HOST="[https://cloud.langfuse.com](https://cloud.langfuse.com)" 
+
+# -----------------------------
+# State Persistence (Optional)
+# -----------------------------
+# Leave as sqlite:///masc_memory.db for local ephemeral testing
+# DATABASE_URL="postgresql://user:password@localhost:5432/masc_db"
+
 ```
 
-*(This file is listed in `.gitignore` and will not be tracked by Git.)*
+---
 
-### 4. Running the Application
+## 🚀 Usage Guide
 
-Launch the Gradio web interface with the following command:
+MASC uses a unified launcher (`main.py`) to expose its four distinct entrypoints.
+
+### 1. Gradio Studio (UI Mode)
+
+The easiest way to interact with MASC, configure personas, and watch the dialectical process unfold in real-time.
 
 ```bash
-python app_advanced.py
+python main.py --mode ui
+
 ```
 
-Navigate to the local URL displayed in your terminal (e.g., `http://127.0.0.1:7860`) to access the application.
+*Navigate to `http://127.0.0.1:7860` in your browser.*
 
-## 🔬 Extending the Framework
+### 2. API Server
 
-A primary goal of this implementation is to facilitate further research. You can easily add new adversarial or
-constructive personas to the framework.
+Deploys a FastAPI instance capable of streaming graph execution states via Server-Sent Events (SSE). Ideal for integrating MASC into existing web applications.
 
-1. Open `masc_t_engine_advanced.py`.
-2. Locate the `ADVERSARY_PERSONAS` dictionary.
-3. Add a new entry with a unique name, a `critique_type`, and a detailed `system_prompt`.
+```bash
+python main.py --mode api
 
-**Example: Adding a "Historical Analogist" persona:**
+```
 
-```python
-'HistoricalAnalogist': {
-    "critique_type": "CONSTRUCTIVE",
-    "system_prompt": "Assume the role of a Historical Analogist. Your function is to analyze the proposed strategy or artifact and identify relevant historical precedents, both successful and failed. Critique the proposal based on lessons learned from these analogies. Provide your output as a list of dictionary objects..."
+*The server will run on `http://0.0.0.0:8000`. Endpoint: `POST /v1/masc/execute`.*
+
+### 3. Command Line Interface (CLI Mode)
+
+Run MASC headlessly for CI/CD pipelines or automated batch processing.
+
+First, generate a base configuration file:
+
+```bash
+python main.py --mode cli --generate-template config.json
+
+```
+
+Then, execute a workflow:
+
+```bash
+python main.py --mode cli --task "Draft a migration strategy to microservices." --config config.json
+
+```
+
+### 4. Model Context Protocol (MCP Mode)
+
+Expose MASC as a tool to external autonomous agents (like Claude Desktop or LangChain agents). The external agent provides the task and config, while MASC handles the internal multi-agent dialectic using its own environment credentials.
+
+```bash
+python main.py --mode mcp
+
+```
+
+**Adding to Claude Desktop (`claude_desktop_config.json`):**
+
+```json
+{
+  "mcpServers": {
+    "MASC-Dialectics": {
+      "command": "python",
+      "args": ["/path/to/masc/main.py", "--mode", "mcp"]
+    }
+  }
 }
+
 ```
 
-After saving the file, relaunch the application. The "HistoricalAnalogist" will now appear as a selectable persona in
-the UI.
+---
+
+## 🔬 Extending the Framework (Custom Personas)
+
+You can easily expand MASC's library of adversarial critics without modifying any Python code. 
+
+To add custom personas, simply create a file named `custom_personas.json` in the root directory of the project (alongside `main.py`). When the application starts, it will automatically load these and merge them with the default personas. They will instantly appear in the Gradio UI dropdowns and be accessible via the CLI and MCP endpoints.
+
+### File Format
+
+The JSON file must consist of a dictionary where the keys are the **Persona Names** (no spaces recommended) and the values are objects containing:
+* `critique_type`: Must be either `"CONSTRUCTIVE"` (aims to improve the artifact) or `"ANTAGONISTIC"` (aims to destroy the artifact's fundamental premise).
+* `system_prompt`: The detailed instructions for the LLM.
+
+**Example `custom_personas.json`:**
+```json
+{
+  "ComplianceOfficer": {
+    "critique_type": "CONSTRUCTIVE",
+    "system_prompt": "Assume the role of a strict Regulatory Compliance Officer. Your function is to audit the proposal for global and US regulatory violations (e.g., GDPR, CCPA, HIPAA). Provide your output as a list of dictionary objects with 'severity', 'description', and 'recommendation' keys."
+  }
+}
+
+```
+
+Restart your environment, and the new persona will instantly be available in the UI, API, and CLI configurations.
+
+---
 
 ## 📄 How to Cite
 
-If you use this work in your research, please cite the original paper.
+If you use this work in your research, please cite the original paper:
 
 ```bibtex
 @techreport{Schneider2025MASCT,
@@ -126,8 +200,9 @@ If you use this work in your research, please cite the original paper.
   institution = {Bielefeld},
   year        = {2025}
 }
+
 ```
 
 ## ⚖️ License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for the full text.
+This project is licensed under the MIT License. See the [LICENSE](https://www.google.com/search?q=LICENSE) file for the full text.

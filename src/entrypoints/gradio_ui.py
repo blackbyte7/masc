@@ -78,10 +78,14 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
             max_turns=max_turns_input
         )
 
-        progress(0.05, desc="Compiling MASC Graph...")
+        progress(0.05, desc="Compiling MASC Graph & Connecting to Telemetry...")
         thread_id = str(uuid.uuid4())
 
-        initial_proposal_content, critiques_json, final_synthesis_content, history_md = "", "", "", ""
+        # Initialize empty states for the UI
+        initial_proposal_content = ""
+        critiques_dict = {"status": "Awaiting adversarial analysis..."}
+        final_synthesis_content = ""
+        history_md = "*Workflow initialized...*"
 
         async for state in execute_masc_workflow(task_desc, masc_config, thread_id):
 
@@ -94,18 +98,24 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
             if "propose" in state:
                 progress(base_progress + (turn_weight * 0.2),
                          desc=f"Cycle {current_turn}: Generating Initial Proposal...")
+
                 initial_proposal_content = state["propose"]["current_artifact"].content
-                yield initial_proposal_content, critiques_json, final_synthesis_content, history_md
+                history = state["propose"]["current_artifact"].history
+                history_md = "\n".join([f"- {entry}" for entry in history])
+
+                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
             if "adversarial_analysis" in state:
                 progress(base_progress + (turn_weight * 0.6),
                          desc=f"Cycle {current_turn}: Adversarial analysis complete.")
+
                 critiques = state["adversarial_analysis"].get("critiques_collection")
                 if critiques and critiques.critiques:
-                    critiques_json = critiques.model_dump_json(indent=2)
+                    critiques_dict = critiques.model_dump()
                 else:
-                    critiques_json = '{"critiques": []}'
-                yield initial_proposal_content, critiques_json, final_synthesis_content, history_md
+                    critiques_dict = {"critiques": []}
+
+                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
             if "synthesize_sequential" in state or "synthesize_architect" in state:
                 progress(base_progress + (turn_weight * 0.9), desc=f"Cycle {current_turn}: Synthesis complete.")
@@ -114,7 +124,8 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
                 final_synthesis_content = synthesis_output["current_artifact"].content
                 history = synthesis_output["current_artifact"].history
                 history_md = "\n".join([f"- {entry}" for entry in history])
-                yield initial_proposal_content, critiques_json, final_synthesis_content, history_md
+
+                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
         progress(1.0, desc=f"Workflow Finished after {max_turns_input} cycles!")
 
@@ -212,10 +223,11 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
             gr.Markdown("## 3. Telemetry & Results")
             with gr.Tabs():
                 with gr.TabItem("Current Synthesis"):
-                    final_synthesis_output = gr.Markdown()
+                    final_synthesis_output = gr.Markdown(label="Hardened Artifact")
                 with gr.TabItem("Process Breakdown"):
                     v1_proposal_output = gr.Markdown("### Initial Proposal (Cycle 1)")
-                    critiques_output = gr.Code(label="Latest Adversarial Critiques", language="json")
+                    # Replaced gr.Code with gr.JSON for better object inspection
+                    critiques_output = gr.JSON(label="Latest Adversarial Critiques")
                 with gr.TabItem("Refinement History Log"):
                     history_output = gr.Markdown()
 

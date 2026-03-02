@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, StateGraph
 
+
 from src.config.settings import settings
 from src.core.personas import ADVERSARY_PERSONAS
 from src.core.state import MASCState, MASCConfig, PersonaConfig, Artifact, CritiquesCollection, Critique
@@ -258,8 +259,8 @@ def should_continue_loop(state: MASCState) -> Literal["adversarial_analysis", "_
     return "__end__"
 
 
-def build_masc_graph(checkpointer) -> StateGraph:
-    """Builds the MASC-T graph, dynamically binding it to the provided PostgreSQL checkpointer."""
+def build_masc_graph(checkpointer) -> CompiledStateGraph:
+    """Builds the MASC graph, dynamically binding it to the provided PostgreSQL checkpointer."""
     nodes = MASCNodes(settings)
     graph_builder = StateGraph(MASCState)
 
@@ -299,6 +300,20 @@ async def execute_masc_workflow(task: str, config: MASCConfig, thread_id: str) -
     """
     initial_state = {"task_description": task, "config": config, "current_turn": 1}
     run_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.max_recursion_depth}
+
+    # Inject Langfuse Callbacks if configured in the environment
+    if settings.langfuse_public_key and settings.langfuse_secret_key:
+        try:
+            from langfuse.callback import CallbackHandler
+            langfuse_handler = CallbackHandler(
+                public_key=settings.langfuse_public_key,
+                secret_key=settings.langfuse_secret_key,
+                host=settings.langfuse_host
+            )
+            run_config["callbacks"] = [langfuse_handler]
+            logger.info("Langfuse observability enabled for this execution.")
+        except ImportError:
+            logger.warning("Langfuse keys found, but langfuse package is not installed. Run 'pip install langfuse'.")
 
     if settings.database_url.startswith("postgres"):
         async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
