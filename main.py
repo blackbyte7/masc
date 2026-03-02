@@ -20,6 +20,12 @@ def main():
     args, unknown = parser.parse_known_args()
 
     if args.mode == "ui":
+        logging.info("🚀 Launching MASC Gradio Studio (FastAPI Mounted)...")
+        from src.entrypoints.gradio_ui import fastapi_app
+        import uvicorn
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=7860)
+
+    if args.mode == "ui":
         logging.info("🚀 Launching MASC Gradio Studio...")
         from src.entrypoints.gradio_ui import app
         app.launch()

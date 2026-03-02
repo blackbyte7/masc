@@ -45,6 +45,19 @@ async def get_checkpointer():
         yield MemorySaver()
 
 
+async def close_pg_pool():
+    """
+    Gracefully closes the global PostgreSQL connection pool.
+    Prevents zombie connections and memory leaks during application shutdown.
+    """
+    global _pg_pool
+    if _pg_pool is not None:
+        logger.info("Draining and closing global PostgreSQL connection pool...")
+        await _pg_pool.close()
+        _pg_pool = None
+        logger.info("PostgreSQL connection pool successfully closed.")
+
+
 class MASCNodes:
     def __init__(self, sys_settings):
         self.settings = sys_settings

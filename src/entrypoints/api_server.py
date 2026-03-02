@@ -1,18 +1,35 @@
 import json
 import logging
 import uuid
-
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.config.settings import settings
-from src.core.engine import execute_masc_workflow
+from src.core.engine import execute_masc_workflow, close_pg_pool
 from src.core.state import MASCConfig
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup phase: The pool initializes lazily in engine.py when first needed
+    yield
+    # Shutdown phase: Teardown async resources
+    await close_pg_pool()
+
 app = FastAPI(title="MASC API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins; restrict to specific domains in strict prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class MASCRequest(BaseModel):

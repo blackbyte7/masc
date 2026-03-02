@@ -1,21 +1,22 @@
 import logging
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 
 import gradio as gr
+from fastapi import FastAPI
 
 from src.config.settings import settings
-from src.core.engine import execute_masc_workflow
+from src.core.engine import execute_masc_workflow, close_pg_pool
 from src.core.personas import ADVERSARY_PERSONAS
 from src.core.state import MASCConfig, PersonaConfig, LLMConfig
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 MODEL_ZOO = {
-    "OpenAI": ["gpt-4.1", "gpt-4.1-mini", "o3", "o4-mini", "gpt-4o"],
-    "Anthropic": ["claude-4-opus-20250514", "claude-4-sonnet-20250514", "claude-3-7-sonnet-20250219"],
-    "Google": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash",
-               "gemini-2.5-flash-lite"],
+    "OpenAI": ["gpt-4.5-preview", "gpt-4o", "gpt-4o-mini", "o3-mini", "o1"],
+    "Anthropic": ["claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
+    "Google": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
     "Ollama": ["llama3", "mistral", "qwen2", "phi3"]
 }
 
@@ -143,7 +144,6 @@ def create_persona_ui(persona_name, is_adversary=False):
             )
 
         provider = gr.Dropdown(label="LLM Provider", choices=list(MODEL_ZOO.keys()), value=settings.default_provider)
-        # allow_custom_value=True guarantees future-proofing
         model = gr.Dropdown(label="Model Name", choices=MODEL_ZOO[settings.default_provider],
                             value=settings.default_model, allow_custom_value=True)
         api_key = gr.Textbox(label="API Key", type="password",
@@ -180,6 +180,18 @@ def create_persona_ui(persona_name, is_adversary=False):
             return provider, api_key, base_url, model, temp, max_tokens
 
 
+# --- FastAPI Lifespan Management ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: the PG pool initializes dynamically when engine.py needs it
+    yield
+    # Shutdown: Safely drain and close the connection pool to prevent zombie connections
+    await close_pg_pool()
+
+# Initialize the base FastAPI app
+fastapi_app = FastAPI(title="MASC Enterprise Studio UI", lifespan=lifespan)
+
+# --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
     gr.Markdown("# MASC: Advanced Workflow Studio")
     all_ui_inputs = []
@@ -226,7 +238,6 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
                     final_synthesis_output = gr.Markdown(label="Hardened Artifact")
                 with gr.TabItem("Process Breakdown"):
                     v1_proposal_output = gr.Markdown("### Initial Proposal (Cycle 1)")
-                    # Replaced gr.Code with gr.JSON for better object inspection
                     critiques_output = gr.JSON(label="Latest Adversarial Critiques")
                 with gr.TabItem("Refinement History Log"):
                     history_output = gr.Markdown()
@@ -237,5 +248,9 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
         outputs=[v1_proposal_output, critiques_output, final_synthesis_output, history_output],
     )
 
+# Mount the Gradio interface onto the FastAPI app
+fastapi_app = gr.mount_gradio_app(fastapi_app, app, path="/")
+
 if __name__ == "__main__":
-    app.launch()
+    import uvicorn
+    uvicorn.run("src.entrypoints.gradio_ui:fastapi_app", host="0.0.0.0", port=7860)
