@@ -34,7 +34,6 @@ async def get_checkpointer():
                 max_size=20,
                 kwargs={"autocommit": True, "prepare_threshold": 0}
             )
-            # Wait for the pool to connect successfully
             await _pg_pool.open()
 
         checkpointer = AsyncPostgresSaver(_pg_pool)

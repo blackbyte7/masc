@@ -28,11 +28,9 @@
 
 ## 📖 Overview
 
-MASC (Modular Adversarial Synergy Chain) is an enterprise-grade framework designed to force AI-generated artifacts to withstand rigorous, multi-vector criticism before finalization. Moving beyond linear generation pipelines, MASC implements a structured, internal dialectical debate (Thesis -> Antithesis -> Synthesis).
+MASC (Modular Adversarial Synergy Chain) is a framework designed to force AI-generated artifacts to withstand rigorous, multi-vector criticism before finalization. Moving beyond linear generation pipelines, MASC implements a structured, internal dialectical debate (Thesis -> Antithesis -> Synthesis).
 
 Whether generating code, strategic proposals, or analytical reports, MASC surrounds the initial generation with specialized adversarial agents (e.g., `CodeAuditor`, `Devil'sAdvocate`, `UncertaintyQuantifier`) that ruthlessly critique the artifact. A Synthesizer then rebuilds the artifact to patch vulnerabilities, optionally looping over multiple cycles to produce a highly robust, hardened final output.
-
-
 
 ## ✨ Key Features
 
@@ -40,8 +38,8 @@ Whether generating code, strategic proposals, or analytical reports, MASC surrou
 * **Universal Entrypoints:** Access the engine via a rich Gradio UI, a FastAPI server, a CLI, or as a native **Model Context Protocol (MCP)** tool for external agentic workflows.
 * **Modular Personas:** A plug-and-play dictionary of specialized critics. Easily define custom adversaries to target domain-specific blind spots.
 * **Granular LLM Routing:** Mix and match providers (OpenAI, Anthropic, Google, local Ollama) on a per-node basis. Run the Proposer on Claude 3.5 Sonnet, the Adversaries on GPT-4o, and the Synthesizer on Llama-3.
-* **Production Observability:** Native, zero-config Langfuse integration for tracing node latency, token usage, and step-by-step reasoning.
-* **Enterprise State Management:** Built-in PostgreSQL checkpointer support for persistent state across complex, long-running graphs.
+* **Observability:** Native, zero-config Langfuse integration for tracing node latency, token usage, and step-by-step reasoning.
+* **State Management:** Built-in PostgreSQL checkpointer support for persistent state across complex, long-running graphs.
 
 ---
 
@@ -179,32 +177,54 @@ To connect Claude Desktop to your running MASC instance, add the following confi
 
 ---
 
-## 🔬 Extending the Framework (Custom Personas)
+## 🦙 Using Local Models (Ollama)
 
-You can easily expand MASC's library of adversarial critics without modifying any Python code.
+MASC fully supports running your workflows using entirely local, open-weight models via Ollama (e.g., `gpt-oss-20b`, `gemma-3`, `deepseek-r1`).
 
-To add custom personas, simply create a file named `custom_personas.json` in the root directory of the project (alongside `main.py`). When the application starts, it will automatically load these and merge them with the default personas. They will instantly appear in the Gradio UI dropdowns and be accessible via the CLI and MCP endpoints.
+**Important Networking Note for Docker Users:**
+If you are running MASC via Docker Compose but your Ollama instance is running natively on your host machine, `localhost` will not work. You must tell the MASC container how to reach your host network.
 
-### File Format
+When configuring your provider in the UI or CLI:
 
-The JSON file must consist of a dictionary where the keys are the **Persona Names** (no spaces recommended) and the values are objects containing:
+* **Provider:** Select `Ollama`
+* **Base URL:** Enter `http://host.docker.internal:11434` (Do **not** use `http://localhost:11434`)
 
-* `critique_type`: Must be either `"CONSTRUCTIVE"` (aims to improve the artifact) or `"ANTAGONISTIC"` (aims to destroy the artifact's fundamental premise).
-* `system_prompt`: The detailed instructions for the LLM.
+Our `docker-compose.yml` is pre-configured with `host-gateway` mapping, meaning this URL will work seamlessly across Windows, macOS, and Linux.
 
-**Example `custom_personas.json`:**
+---
+
+## 🎭 Custom Personas Architecture
+
+MASC is built around a plug-and-play architectural pattern for specialized adversarial agents. You are not limited to the default personas (e.g., `Devil's Advocate`, `Code Auditor`). You can inject custom critics tailored to your specific domain without modifying a single line of Python.
+
+### How it Works
+
+At runtime, MASC's engine dynamically loads and merges personas. By creating a `custom_personas.json` file in the root directory, you override the engine's internal dictionary.
+
+**1. Create your definition:**
+Create `custom_personas.json` next to `main.py`:
 
 ```json
 {
   "ComplianceOfficer": {
     "critique_type": "CONSTRUCTIVE",
-    "system_prompt": "Assume the role of a strict Regulatory Compliance Officer. Your function is to audit the proposal for global and US regulatory violations (e.g., GDPR, CCPA, HIPAA). Provide your output as a list of dictionary objects with 'severity', 'description', and 'recommendation' keys."
+    "system_prompt": "Assume the role of a strict Regulatory Compliance Officer. Your function is to audit the proposal for global regulatory violations (e.g., GDPR, CCPA, HIPAA). Provide your output as a list of dictionary objects with 'severity', 'description', and 'recommendation' keys."
+  },
+  "Nihilist": {
+    "critique_type": "ANTAGONISTIC",
+    "system_prompt": "Act as a pure antagonist. Identify the core business value claimed by the text and formulate a devastating argument as to why the endeavor is financially ruinous. Do not offer solutions. Your output is designed to be refuted, not integrated."
   }
 }
 
 ```
 
-Restart your environment, and the new persona will instantly be available in the UI, API, and CLI configurations.
+**2. Restart MASC:**
+Upon restart, MASC will validate your schema. Valid personas will instantly populate in the Gradio UI dropdowns, the CLI template generator, and the MCP server configuration.
+
+**Note on `critique_type`:**
+
+* `"CONSTRUCTIVE"`: The Synthesizer agent will attempt to surgically patch the artifact based on the provided recommendations.
+* `"ANTAGONISTIC"`: The Synthesizer agent will ignore the recommendations and instead rewrite the core proposal to explicitly defend against the underlying ideological challenge.
 
 ---
 
@@ -224,4 +244,4 @@ If you use this work in your research, please cite the original paper:
 
 ## ⚖️ License
 
-This project is licensed under the MIT License. See the [LICENSE](https://www.google.com/search?q=LICENSE) file for the full text.
+This project is licensed under the MIT License. See the LICENSE file for the full text.

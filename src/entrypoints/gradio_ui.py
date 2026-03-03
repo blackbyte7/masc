@@ -13,13 +13,6 @@ from src.core.state import MASCConfig, PersonaConfig, LLMConfig
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-MODEL_ZOO = {
-    "OpenAI": ["gpt-4.5-preview", "gpt-4o", "gpt-4o-mini", "o3-mini", "o1"],
-    "Anthropic": ["claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
-    "Google": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
-    "Ollama": ["llama3", "mistral", "qwen2", "phi3"]
-}
-
 
 async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=True)):
     """Orchestrates the MASC process as an async generator, updating Gradio UI."""
@@ -143,9 +136,20 @@ def create_persona_ui(persona_name, is_adversary=False):
                 label="Persona Type", choices=["NONE"] + list(ADVERSARY_PERSONAS.keys()), value="NONE"
             )
 
-        provider = gr.Dropdown(label="LLM Provider", choices=list(MODEL_ZOO.keys()), value=settings.default_provider)
-        model = gr.Dropdown(label="Model Name", choices=MODEL_ZOO[settings.default_provider],
-                            value=settings.default_model, allow_custom_value=True)
+        provider = gr.Dropdown(label="LLM Provider", choices=["OpenAI", "Anthropic", "Google", "Ollama"],
+                               value=settings.default_provider)
+
+        with gr.Row():
+            from src.utils.model_fetcher import FALLBACK_MODELS
+            model = gr.Dropdown(
+                label="Model Name",
+                choices=FALLBACK_MODELS.get(settings.default_provider, []),
+                value=settings.default_model,
+                allow_custom_value=True,
+                scale=4
+            )
+            refresh_btn = gr.Button("🔄 Fetch Latest", scale=1)
+
         api_key = gr.Textbox(label="API Key", type="password",
                              placeholder="Leave blank for env vars (Not needed for Ollama)")
         base_url = gr.Textbox(label="Base URL",
@@ -156,7 +160,7 @@ def create_persona_ui(persona_name, is_adversary=False):
                                value=settings.default_max_tokens)
 
         def update_provider_settings(prov):
-            choices = MODEL_ZOO.get(prov, [])
+            choices = FALLBACK_MODELS.get(prov, [])
             show_base_url = prov in ["Ollama", "OpenAI"]
             return (
                 gr.update(choices=choices, value=choices[0] if choices else None),
@@ -164,6 +168,13 @@ def create_persona_ui(persona_name, is_adversary=False):
             )
 
         provider.change(fn=update_provider_settings, inputs=provider, outputs=[model, base_url])
+
+        async def trigger_model_fetch(prov, key, url):
+            from src.utils.model_fetcher import fetch_available_models
+            new_models = await fetch_available_models(prov, key, url)
+            return gr.update(choices=new_models, value=new_models[0] if new_models else None)
+
+        refresh_btn.click(fn=trigger_model_fetch, inputs=[provider, api_key, base_url], outputs=[model])
 
         if is_adversary:
             def toggle_adversary_inputs(persona_type):
@@ -180,7 +191,7 @@ def create_persona_ui(persona_name, is_adversary=False):
             return provider, api_key, base_url, model, temp, max_tokens
 
 
-# --- FastAPI Lifespan Management ---
+# FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: the PG pool initializes dynamically when engine.py needs it
@@ -188,7 +199,6 @@ async def lifespan(app: FastAPI):
     # Shutdown: Safely drain and close the connection pool to prevent zombie connections
     await close_pg_pool()
 
-# Initialize the base FastAPI app
 fastapi_app = FastAPI(title="MASC Enterprise Studio UI", lifespan=lifespan)
 
 # --- Gradio UI Layout ---
@@ -248,7 +258,6 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
         outputs=[v1_proposal_output, critiques_output, final_synthesis_output, history_output],
     )
 
-# Mount the Gradio interface onto the FastAPI app
 fastapi_app = gr.mount_gradio_app(fastapi_app, app, path="/")
 
 if __name__ == "__main__":

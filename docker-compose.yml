@@ -5,6 +5,8 @@ services:
     build: .
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - DATABASE_URL=postgresql://masc_user:masc_pass@postgres:5432/masc_db
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -19,6 +21,8 @@ services:
     build: .
     ports:
       - "7860:7860"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - DATABASE_URL=postgresql://masc_user:masc_pass@postgres:5432/masc_db
       - OPENAI_API_KEY=${OPENAI_API_KEY}
