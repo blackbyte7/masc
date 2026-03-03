@@ -45,7 +45,7 @@ Whether generating code, strategic proposals, or analytical reports, MASC surrou
 
 ## 🛠️ Installation & Setup
 
-MASC requires a PostgreSQL database for state persistence and several API keys for its modular adversaries. Docker is the recommended way to run the entire suite cleanly.
+MASC runs out-of-the-box using an in-memory checkpointer and can operate entirely on local models (via Ollama) without any API keys. For production deployments requiring long-term state persistence across sessions, an optional PostgreSQL database is supported. Docker is the recommended way to run the entire suite cleanly, especially if you choose to utilize the Postgres checkpointer.
 
 ### 1. Clone the Repository
 ```bash
