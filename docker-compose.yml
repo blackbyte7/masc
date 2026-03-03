@@ -15,7 +15,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["python", "main.py", "--mode", "api"]
+    command: [ "python", "main.py", "--mode", "api" ]
 
   masc-ui:
     build: .
@@ -29,7 +29,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["python", "main.py", "--mode", "ui"]
+    command: [ "python", "main.py", "--mode", "ui" ]
 
   postgres:
     image: postgres:15-alpine
@@ -42,7 +42,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U masc_user -d masc_db"]
+      test: [ "CMD-SHELL", "pg_isready -U masc_user -d masc_db" ]
       interval: 5s
       timeout: 5s
       retries: 5

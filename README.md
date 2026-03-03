@@ -28,26 +28,40 @@
 
 ## 📖 Overview
 
-MASC (Modular Adversarial Synergy Chain) is a framework designed to force AI-generated artifacts to withstand rigorous, multi-vector criticism before finalization. Moving beyond linear generation pipelines, MASC implements a structured, internal dialectical debate (Thesis -> Antithesis -> Synthesis).
+MASC (Modular Adversarial Synergy Chain) is a framework designed to force AI-generated artifacts to withstand rigorous,
+multi-vector criticism before finalization. Moving beyond linear generation pipelines, MASC implements a structured,
+internal dialectical debate (Thesis -> Antithesis -> Synthesis).
 
-Whether generating code, strategic proposals, or analytical reports, MASC surrounds the initial generation with specialized adversarial agents (e.g., `CodeAuditor`, `Devil'sAdvocate`, `UncertaintyQuantifier`) that ruthlessly critique the artifact. A Synthesizer then rebuilds the artifact to patch vulnerabilities, optionally looping over multiple cycles to produce a highly robust, hardened final output.
+Whether generating code, strategic proposals, or analytical reports, MASC surrounds the initial generation with
+specialized adversarial agents (e.g., `CodeAuditor`, `Devil'sAdvocate`, `UncertaintyQuantifier`) that ruthlessly
+critique the artifact. A Synthesizer then rebuilds the artifact to patch vulnerabilities, optionally looping over
+multiple cycles to produce a highly robust, hardened final output.
 
 ## ✨ Key Features
 
 * **Dialectical Engine:** Implements a strict Propose ➔ Critique ➔ Synthesize cycle managed by LangGraph.
-* **Universal Entrypoints:** Access the engine via a rich Gradio UI, a FastAPI server, a CLI, or as a native **Model Context Protocol (MCP)** tool for external agentic workflows.
-* **Modular Personas:** A plug-and-play dictionary of specialized critics. Easily define custom adversaries to target domain-specific blind spots.
-* **Granular LLM Routing:** Mix and match providers (OpenAI, Anthropic, Google, local Ollama) on a per-node basis. Run the Proposer on Claude 3.5 Sonnet, the Adversaries on GPT-4o, and the Synthesizer on Llama-3.
-* **Observability:** Native, zero-config Langfuse integration for tracing node latency, token usage, and step-by-step reasoning.
-* **State Management:** Built-in PostgreSQL checkpointer support for persistent state across complex, long-running graphs.
+* **Universal Entrypoints:** Access the engine via a rich Gradio UI, a FastAPI server, a CLI, or as a native **Model
+  Context Protocol (MCP)** tool for external agentic workflows.
+* **Modular Personas:** A plug-and-play dictionary of specialized critics. Easily define custom adversaries to target
+  domain-specific blind spots.
+* **Granular LLM Routing:** Mix and match providers (OpenAI, Anthropic, Google, local Ollama) on a per-node basis. Run
+  the Proposer on Claude 3.5 Sonnet, the Adversaries on GPT-4o, and the Synthesizer on Llama-3.
+* **Observability:** Native, zero-config Langfuse integration for tracing node latency, token usage, and step-by-step
+  reasoning.
+* **State Management:** Built-in PostgreSQL checkpointer support for persistent state across complex, long-running
+  graphs.
 
 ---
 
 ## 🛠️ Installation & Setup
 
-MASC runs out-of-the-box using an in-memory checkpointer and can operate entirely on local models (via Ollama) without any API keys. For production deployments requiring long-term state persistence across sessions, an optional PostgreSQL database is supported. Docker is the recommended way to run the entire suite cleanly, especially if you choose to utilize the Postgres checkpointer.
+MASC runs out-of-the-box using an in-memory checkpointer and can operate entirely on local models (via Ollama) without
+any API keys. For production deployments requiring long-term state persistence across sessions, an optional PostgreSQL
+database is supported. Docker is the recommended way to run the entire suite cleanly, especially if you choose to
+utilize the Postgres checkpointer.
 
 ### 1. Clone the Repository
+
 ```bash
 git clone [https://github.com/your-username/masc.git](https://github.com/your-username/masc.git)
 cd masc
@@ -56,7 +70,8 @@ cd masc
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the root directory. MASC will automatically route to the correct provider based on your workflow configuration.
+Create a `.env` file in the root directory. MASC will automatically route to the correct provider based on your workflow
+configuration.
 
 ```env
 # -----------------------------
@@ -111,7 +126,8 @@ python main.py --mode ui
 
 ### 2. API Server
 
-Deploys a FastAPI instance capable of streaming graph execution states via Server-Sent Events (SSE). Ideal for integrating MASC into existing web applications.
+Deploys a FastAPI instance capable of streaming graph execution states via Server-Sent Events (SSE). Ideal for
+integrating MASC into existing web applications.
 
 ```bash
 # If running locally without Docker:
@@ -141,13 +157,17 @@ python main.py --mode cli --task "Draft a migration strategy to microservices." 
 
 ### 4. Model Context Protocol (MCP Mode) via Docker
 
-You can expose MASC as a powerful, adversarial tool to external autonomous agents (like Claude Desktop, Cursor, or LangChain agents). Because MASC requires a database and complex dependencies, the cleanest way to connect it is by pointing your MCP client to the Docker container.
+You can expose MASC as a powerful, adversarial tool to external autonomous agents (like Claude Desktop, Cursor, or
+LangChain agents). Because MASC requires a database and complex dependencies, the cleanest way to connect it is by
+pointing your MCP client to the Docker container.
 
-The external agent provides the task and configuration, while the isolated container handles the multi-agent dialectic securely.
+The external agent provides the task and configuration, while the isolated container handles the multi-agent dialectic
+securely.
 
 **Adding to Claude Desktop (`claude_desktop_config.json`):**
 
-To connect Claude Desktop to your running MASC instance, add the following configuration. By using `docker compose run`, the MCP process automatically connects to the PostgreSQL database network and inherits your `.env` keys.
+To connect Claude Desktop to your running MASC instance, add the following configuration. By using `docker compose run`,
+the MCP process automatically connects to the PostgreSQL database network and inherits your `.env` keys.
 
 ```json
 {
@@ -179,27 +199,33 @@ To connect Claude Desktop to your running MASC instance, add the following confi
 
 ## 🦙 Using Local Models (Ollama)
 
-MASC fully supports running your workflows using entirely local, open-weight models via Ollama (e.g., `gpt-oss-20b`, `gemma-3`, `deepseek-r1`).
+MASC fully supports running your workflows using entirely local, open-weight models via Ollama (
+e.g., `gpt-oss-20b`, `gemma-3`, `deepseek-r1`).
 
 **Important Networking Note for Docker Users:**
-If you are running MASC via Docker Compose but your Ollama instance is running natively on your host machine, `localhost` will not work. You must tell the MASC container how to reach your host network.
+If you are running MASC via Docker Compose but your Ollama instance is running natively on your host
+machine, `localhost` will not work. You must tell the MASC container how to reach your host network.
 
 When configuring your provider in the UI or CLI:
 
 * **Provider:** Select `Ollama`
 * **Base URL:** Enter `http://host.docker.internal:11434` (Do **not** use `http://localhost:11434`)
 
-Our `docker-compose.yml` is pre-configured with `host-gateway` mapping, meaning this URL will work seamlessly across Windows, macOS, and Linux.
+Our `docker-compose.yml` is pre-configured with `host-gateway` mapping, meaning this URL will work seamlessly across
+Windows, macOS, and Linux.
 
 ---
 
 ## 🎭 Custom Personas Architecture
 
-MASC is built around a plug-and-play architectural pattern for specialized adversarial agents. You are not limited to the default personas (e.g., `Devil's Advocate`, `Code Auditor`). You can inject custom critics tailored to your specific domain without modifying a single line of Python.
+MASC is built around a plug-and-play architectural pattern for specialized adversarial agents. You are not limited to
+the default personas (e.g., `Devil's Advocate`, `Code Auditor`). You can inject custom critics tailored to your specific
+domain without modifying a single line of Python.
 
 ### How it Works
 
-At runtime, MASC's engine dynamically loads and merges personas. By creating a `custom_personas.json` file in the root directory, you override the engine's internal dictionary.
+At runtime, MASC's engine dynamically loads and merges personas. By creating a `custom_personas.json` file in the root
+directory, you override the engine's internal dictionary.
 
 **1. Create your definition:**
 Create `custom_personas.json` next to `main.py`:
@@ -219,12 +245,15 @@ Create `custom_personas.json` next to `main.py`:
 ```
 
 **2. Restart MASC:**
-Upon restart, MASC will validate your schema. Valid personas will instantly populate in the Gradio UI dropdowns, the CLI template generator, and the MCP server configuration.
+Upon restart, MASC will validate your schema. Valid personas will instantly populate in the Gradio UI dropdowns, the CLI
+template generator, and the MCP server configuration.
 
 **Note on `critique_type`:**
 
-* `"CONSTRUCTIVE"`: The Synthesizer agent will attempt to surgically patch the artifact based on the provided recommendations.
-* `"ANTAGONISTIC"`: The Synthesizer agent will ignore the recommendations and instead rewrite the core proposal to explicitly defend against the underlying ideological challenge.
+* `"CONSTRUCTIVE"`: The Synthesizer agent will attempt to surgically patch the artifact based on the provided
+  recommendations.
+* `"ANTAGONISTIC"`: The Synthesizer agent will ignore the recommendations and instead rewrite the core proposal to
+  explicitly defend against the underlying ideological challenge.
 
 ---
 

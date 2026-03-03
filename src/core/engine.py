@@ -275,7 +275,8 @@ class MASCNodes:
         })
 
         history_log.append(f"[Turn {current_turn}] Architect unified critiques into a hardened artifact.")
-        final_artifact = Artifact(version=f"{current_turn + 1}.0_architect", content=response.content, history=history_log)
+        final_artifact = Artifact(version=f"{current_turn + 1}.0_architect", content=response.content,
+                                  history=history_log)
 
         return {"current_artifact": final_artifact, "current_turn": current_turn + 1}
 

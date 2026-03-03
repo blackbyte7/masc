@@ -1,6 +1,7 @@
 import pytest
-from src.core.state import MASCState, Artifact, CritiquesCollection, Critique
+
 from src.core.engine import should_route_to_synthesis, should_continue_loop
+from src.core.state import MASCState, Artifact
 
 
 @pytest.mark.asyncio
@@ -33,7 +34,7 @@ async def test_loop_continuation(base_masc_config):
         "task_description": "Test",
         "config": base_masc_config,
         "current_artifact": Artifact(version="1.0", content="test"),
-        "current_turn": 1,  # Max turns is 1
+        "current_turn": 1,
         "critiques_collection": None
     }
 

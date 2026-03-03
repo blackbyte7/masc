@@ -1,6 +1,7 @@
 import json
 import os
-from src.core.personas import load_personas, DEFAULT_ADVERSARY_PERSONAS
+
+from src.core.personas import load_personas
 
 
 def test_default_personas_loaded():

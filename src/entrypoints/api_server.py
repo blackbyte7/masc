@@ -2,6 +2,7 @@ import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown phase: Teardown async resources
     await close_pg_pool()
+
 
 app = FastAPI(title="MASC API", version="2.0.0")
 

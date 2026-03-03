@@ -1,4 +1,5 @@
 import os
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -11,9 +12,11 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 from src.entrypoints.api_server import app
 from src.core.state import MASCConfig, PersonaConfig, LLMConfig
 
+
 @pytest.fixture
 def test_client():
     return TestClient(app)
+
 
 @pytest.fixture
 def default_llm_config():
@@ -23,6 +26,7 @@ def default_llm_config():
         model_name="gpt-4o-mini",
         temperature=0.0
     )
+
 
 @pytest.fixture
 def base_masc_config(default_llm_config):

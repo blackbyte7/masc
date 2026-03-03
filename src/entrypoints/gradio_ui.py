@@ -199,6 +199,7 @@ async def lifespan(app: FastAPI):
     # Shutdown: Safely drain and close the connection pool to prevent zombie connections
     await close_pg_pool()
 
+
 fastapi_app = FastAPI(title="MASC Enterprise Studio UI", lifespan=lifespan)
 
 # --- Gradio UI Layout ---
@@ -262,4 +263,5 @@ fastapi_app = gr.mount_gradio_app(fastapi_app, app, path="/")
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("src.entrypoints.gradio_ui:fastapi_app", host="0.0.0.0", port=7860)
