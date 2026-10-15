@@ -33,23 +33,37 @@ multi-vector criticism before finalization. Moving beyond linear generation pipe
 internal dialectical debate (Thesis -> Antithesis -> Synthesis).
 
 Whether generating code, strategic proposals, or analytical reports, MASC surrounds the initial generation with
-specialized adversarial agents (e.g., `CodeAuditor`, `Devil'sAdvocate`, `UncertaintyQuantifier`) that ruthlessly
+specialized adversarial agents (e.g., `CodeAuditor`, `DA`, `UncertaintyQuantifier`, `SecurityHawk`) that ruthlessly
 critique the artifact. A Synthesizer then rebuilds the artifact to patch vulnerabilities, optionally looping over
 multiple cycles to produce a highly robust, hardened final output.
 
 ## ✨ Key Features
 
 * **Dialectical Engine:** Implements a strict Propose ➔ Critique ➔ Synthesize cycle managed by LangGraph.
-* **Universal Entrypoints:** Access the engine via a rich Gradio UI, a FastAPI server, a CLI, or as a native **Model
-  Context Protocol (MCP)** tool for external agentic workflows.
-* **Modular Personas:** A plug-and-play dictionary of specialized critics. Easily define custom adversaries to target
-  domain-specific blind spots.
-* **Granular LLM Routing:** Mix and match providers (OpenAI, Anthropic, Google, local Ollama) on a per-node basis. Run
-  the Proposer on Claude 3.5 Sonnet, the Adversaries on GPT-4o, and the Synthesizer on Llama-3.
-* **Observability:** Native, zero-config Langfuse integration for tracing node latency, token usage, and step-by-step
-  reasoning.
-* **State Management:** Built-in PostgreSQL checkpointer support for persistent state across complex, long-running
-  graphs.
+* **Universal Entrypoints:** Access the engine via a rich Gradio UI, a FastAPI server, a CLI, or as a native **Model Context Protocol (MCP)** tool for external agentic workflows.
+* **Modular Personas:** A plug-and-play dictionary of specialized critics. Easily define custom adversaries to target domain-specific blind spots.
+* **Granular LLM Routing:** Mix and match providers (OpenAI, Anthropic, Google, local Ollama) on a per-node basis. Run the Proposer on Claude, the Adversaries on GPT, and the Synthesizer on Llama-3.
+* **Observability:** Native, zero-config Langfuse integration for tracing node latency, token usage, and step-by-step reasoning.
+* **State Management:** Built-in PostgreSQL checkpointer support for persistent state across complex, long-running graphs.
+
+---
+
+## 🧠 Dual Synthesis Protocols
+
+The true power of MASC lies in how it intelligently resolves conflicting adversarial feedback. The Synthesis Node is a pluggable module that supports various synthesis strategies, allowing you to select the optimal protocol based on the specific requirements of the task.
+
+### Sequential Refinement (The Iterative Path) - *Default*
+This protocol is a robust choice for technical tasks, code generation, and processes requiring high reliability and a clear, auditable trail of changes. It operates as a stateful, iterative loop, deterministically triaging critiques (`ANTAGONISTIC` first, followed by `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW` severity `CONSTRUCTIVE` critiques) and resolving conflicts while anchored to the original task description.
+* **Best For:** Verifiable domains (like code or data pipelines), tasks demanding high security or accuracy, and scenarios where traceability of changes is paramount.
+
+### The Architect Protocol (Holistic Integration)
+This protocol is a holistic strategy designed for high-stakes creative or strategic tasks where a globally optimal solution is desired. It integrates all constructive feedback and refutes antagonistic challenges in a planned and unified manner.
+* **Best For:** Creative or strategic tasks, non-verifiable domains, and scenarios where novel synthesis is valued over strict traceability.
+
+**Configuration Options:**
+You can easily toggle between these protocols depending on your entrypoint:
+* **Gradio UI:** Use the "Synthesis Protocol" radio button under the "Workflow Configuration" tab.
+* **CLI / API / MCP:** Set the `"synthesis_protocol"` key in your JSON configuration file to either `"Sequential Refinement"` or `"Architect"`.
 
 ---
 
@@ -65,7 +79,6 @@ utilize the Postgres checkpointer.
 ```bash
 git clone [https://github.com/your-username/masc.git](https://github.com/your-username/masc.git)
 cd masc
-
 ```
 
 ### 2. Configure Environment Variables
@@ -82,19 +95,23 @@ ANTHROPIC_API_KEY="sk-ant-..."
 GOOGLE_API_KEY="AIza..."
 
 # -----------------------------
+# API Server Security (Optional)
+# -----------------------------
+# MASC_API_KEY="your-production-bearer-token"
+
+# -----------------------------
 # Observability (Optional)
 # -----------------------------
 LANGFUSE_PUBLIC_KEY="pk-lf-..."
 LANGFUSE_SECRET_KEY="sk-lf-..."
 # Use [https://us.cloud.langfuse.com](https://us.cloud.langfuse.com) if using US data residency
-LANGFUSE_HOST="[https://cloud.langfuse.com](https://cloud.langfuse.com)" 
+LANGFUSE_HOST="[https://cloud.langfuse.com](https://cloud.langfuse.com)"
 
 # -----------------------------
-# State Persistence 
+# State Persistence
 # -----------------------------
 # Required if running outside of Docker. Docker Compose handles this automatically.
-# DATABASE_URL="postgresql://user:password@localhost:5432/masc_db"
-
+# DATABASE_URL="postgresql://masc_user:masc_pass@localhost:5432/masc_db"
 ```
 
 ### 3. Build and Start the Infrastructure
@@ -103,7 +120,6 @@ Spin up the database and the backend services in detached mode:
 
 ```bash
 docker compose up -d
-
 ```
 
 ---
@@ -119,7 +135,6 @@ The easiest way to interact with MASC, configure personas, and watch the dialect
 ```bash
 # If running locally without Docker:
 python main.py --mode ui
-
 ```
 
 *Navigate to `http://127.0.0.1:7860` in your browser.*
@@ -132,10 +147,9 @@ integrating MASC into existing web applications.
 ```bash
 # If running locally without Docker:
 python main.py --mode api
-
 ```
 
-*The server will run on `http://0.0.0.0:8000`. Endpoint: `POST /v1/masc/execute`.*
+*The server will run on `http://0.0.0.0:8000`. Endpoints: `POST /v1/masc/execute` and `GET /health`.*
 
 ### 3. Command Line Interface (CLI Mode)
 
@@ -145,14 +159,12 @@ First, generate a base configuration file:
 
 ```bash
 python main.py --mode cli --generate-template config.json
-
 ```
 
 Then, execute a workflow:
 
 ```bash
 python main.py --mode cli --task "Draft a migration strategy to microservices." --config config.json
-
 ```
 
 ### 4. Model Context Protocol (MCP Mode) via Docker
@@ -190,7 +202,6 @@ the MCP process automatically connects to the PostgreSQL database network and in
     }
   }
 }
-
 ```
 
 *Note: Be sure to replace `/absolute/path/to/masc/docker-compose.yml` with the actual path to your cloned directory.*
@@ -199,8 +210,7 @@ the MCP process automatically connects to the PostgreSQL database network and in
 
 ## 🦙 Using Local Models (Ollama)
 
-MASC fully supports running your workflows using entirely local, open-weight models via Ollama (
-e.g., `gpt-oss-20b`, `gemma-3`, `deepseek-r1`).
+MASC fully supports running your workflows using entirely local, open-weight models via Ollama (e.g., `deepseek-r1`, `llama-3.3`, `mistral`, `qwen2.5`).
 
 **Important Networking Note for Docker Users:**
 If you are running MASC via Docker Compose but your Ollama instance is running natively on your host
@@ -219,13 +229,13 @@ Windows, macOS, and Linux.
 ## 🎭 Custom Personas Architecture
 
 MASC is built around a plug-and-play architectural pattern for specialized adversarial agents. You are not limited to
-the default personas (e.g., `Devil's Advocate`, `Code Auditor`). You can inject custom critics tailored to your specific
+the default personas (e.g., `DA`, `CodeAuditor`). You can inject custom critics tailored to your specific
 domain without modifying a single line of Python.
 
 ### How it Works
 
 At runtime, MASC's engine dynamically loads and merges personas. By creating a `custom_personas.json` file in the root
-directory, you override the engine's internal dictionary.
+directory, you extend or override the engine's internal dictionary.
 
 **1. Create your definition:**
 Create `custom_personas.json` next to `main.py`:
@@ -234,26 +244,32 @@ Create `custom_personas.json` next to `main.py`:
 {
   "ComplianceOfficer": {
     "critique_type": "CONSTRUCTIVE",
-    "system_prompt": "Assume the role of a strict Regulatory Compliance Officer. Your function is to audit the proposal for global regulatory violations (e.g., GDPR, CCPA, HIPAA). Provide your output as a list of dictionary objects with 'severity', 'description', and 'recommendation' keys."
+    "system_prompt": "Assume the role of a strict Regulatory Compliance Officer. Your function is to audit the proposal for global regulatory violations (e.g., GDPR, CCPA, HIPAA). Provide your output as a list of critique items with 'severity' ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW'), 'description', and 'recommendation' fields."
   },
   "Nihilist": {
     "critique_type": "ANTAGONISTIC",
-    "system_prompt": "Act as a pure antagonist. Identify the core business value claimed by the text and formulate a devastating argument as to why the endeavor is financially ruinous. Do not offer solutions. Your output is designed to be refuted, not integrated."
+    "system_prompt": "Act as a pure antagonist. Identify the core business value claimed by the text and formulate a devastating argument as to why the endeavor is financially ruinous. Do not offer solutions. Your output is designed to be refuted, not integrated. Provide your output as a list of critique items with 'severity' (always 'HIGH'), 'description', and 'recommendation' fields."
   }
 }
-
 ```
 
 **2. Restart MASC:**
-Upon restart, MASC will validate your schema. Valid personas will instantly populate in the Gradio UI dropdowns, the CLI
-template generator, and the MCP server configuration.
+Upon restart, MASC will validate your schema. Valid personas will instantly populate in the Gradio UI dropdowns and be accepted by the API, CLI, and MCP server.
 
 **Note on `critique_type`:**
 
-* `"CONSTRUCTIVE"`: The Synthesizer agent will attempt to surgically patch the artifact based on the provided
-  recommendations.
-* `"ANTAGONISTIC"`: The Synthesizer agent will ignore the recommendations and instead rewrite the core proposal to
-  explicitly defend against the underlying ideological challenge.
+* `"CONSTRUCTIVE"`: The Synthesizer agent will patch the artifact based on the provided recommendations.
+* `"ANTAGONISTIC"`: The Synthesizer agent will ignore the destructive premise and instead rewrite the core proposal to explicitly defend against the underlying ideological challenge.
+
+---
+
+## 🤝 Pairing Personas with Synthesis Protocols
+
+To get the most out of MASC, align your custom adversaries with the appropriate synthesis protocol based on your task domain:
+
+* **For the Sequential Protocol (Verifiable Tasks):** Map adversaries to the technical nature of the task. Prioritize technical auditors like `CodeAuditor`, `SecurityHawk`, or custom personas like `ZeroTrustArchitect`. Because the Sequential path applies fixes in a prioritized, stateful loop, it excels at methodically knocking out strict technical and security vulnerabilities.
+* **For the Architect Protocol (Strategic/Creative Tasks):** Analytical or strategic tasks demand epistemic and contextual critics. Use personas like `UncertaintyQuantifier`, `ContextualChallenger`, or a custom `UXPessimist`. The Architect's holistic approach is ideal for balancing nuanced, competing viewpoints and integrating them into a globally optimal solution.
+* **Universal Hardening:** For any high-stakes artifact where the defensibility of its core argument is paramount, a pure antagonist like `DA` (or a custom `NihilisticDetractor`) should be included regardless of the chosen protocol.
 
 ---
 
@@ -268,7 +284,6 @@ If you use this work in your research, please cite the original paper:
   institution = {Bielefeld},
   year        = {2025}
 }
-
 ```
 
 ## ⚖️ License

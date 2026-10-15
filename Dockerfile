@@ -1,30 +1,43 @@
-FROM python:3.10-slim
+# Stage 1: Builder
+FROM python:3.10-slim AS builder
 
-# Prevent Python from writing pyc files and enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-WORKDIR /app
+WORKDIR /build
 
-# Install system dependencies required for psycopg
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /build/wheels -r requirements.txt
+
+# Stage 2: Production Runtime
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install runtime-only libpq5 without gcc or build headers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appuser
+
+COPY --from=builder /build/wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
 COPY . .
 
-# Ensure the entrypoint script has executable permissions inside the container
-RUN chmod +x docker-entrypoint.sh
+RUN chmod +x docker-entrypoint.sh && chown -R appuser:appgroup /app
 
-# Expose ports for UI and API
+USER appuser
+
 EXPOSE 7860 8000
 
-# Use the custom entrypoint script to handle pre-flight checks
 ENTRYPOINT ["./docker-entrypoint.sh"]
-
-# Default to API server, can be overridden by docker-compose
 CMD ["python", "main.py", "--mode", "api"]

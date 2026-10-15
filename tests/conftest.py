@@ -9,8 +9,8 @@ os.environ["ANTHROPIC_API_KEY"] = "test-key-anthropic"
 os.environ["GOOGLE_API_KEY"] = "test-key-google"
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
+from src.core.state import LLMConfig, MASCConfig, PersonaConfig
 from src.entrypoints.api_server import app
-from src.core.state import MASCConfig, PersonaConfig, LLMConfig
 
 
 @pytest.fixture
@@ -24,7 +24,7 @@ def default_llm_config():
         provider="OpenAI",
         api_key="test-key-openai",
         model_name="gpt-4o-mini",
-        temperature=0.0
+        temperature=0.0,
     )
 
 
@@ -33,9 +33,7 @@ def base_masc_config(default_llm_config):
     return MASCConfig(
         proposer=PersonaConfig(persona_name="Proposer", llm_config=default_llm_config),
         synthesizer=PersonaConfig(persona_name="Synthesizer", llm_config=default_llm_config),
-        adversaries=[
-            PersonaConfig(persona_name="DA", llm_config=default_llm_config)
-        ],
+        adversaries=[PersonaConfig(persona_name="DA", llm_config=default_llm_config)],
         synthesis_protocol="Sequential Refinement",
-        max_turns=1
+        max_turns=1,
     )

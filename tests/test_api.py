@@ -1,21 +1,128 @@
+import json
+
+import pytest
+
+from src.config.settings import settings
+from src.core.state import Artifact
+
+
+def test_health_endpoint(test_client):
+    response = test_client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "healthy"}
+
+
 def test_execute_masc_endpoint_validation_error(test_client):
-    # Missing required fields
+    # Missing required config field
     response = test_client.post("/v1/masc/execute", json={"task_description": "Do something"})
+    assert response.status_code == 422
+
+
+def test_execute_masc_empty_task_description(test_client, base_masc_config):
+    payload = {
+        "task_description": "",
+        "config": base_masc_config.model_dump(),
+    }
+    response = test_client.post("/v1/masc/execute", json=payload)
     assert response.status_code == 422
 
 
 def test_execute_masc_max_adversaries_limit(test_client, base_masc_config):
     # Duplicate adversaries to exceed limit (default max is 5)
-    for i in range(10):
-        base_masc_config.adversaries.append(
-            base_masc_config.adversaries[0]
-        )
+    for _ in range(10):
+        base_masc_config.adversaries.append(base_masc_config.adversaries[0])
 
     payload = {
         "task_description": "Test high adversaries",
-        "config": base_masc_config.model_dump()
+        "config": base_masc_config.model_dump(),
     }
 
     response = test_client.post("/v1/masc/execute", json=payload)
     assert response.status_code == 400
     assert "Exceeded max adversaries" in response.json()["detail"]
+
+
+def test_execute_masc_unknown_persona(test_client, base_masc_config):
+    base_masc_config.adversaries[0].persona_name = "NonExistentPersona"
+    payload = {
+        "task_description": "Test unknown persona",
+        "config": base_masc_config.model_dump(),
+    }
+
+    response = test_client.post("/v1/masc/execute", json=payload)
+    assert response.status_code == 400
+    assert "Unknown adversary persona" in response.json()["detail"]
+
+
+def test_execute_masc_auth_guard(test_client, base_masc_config, monkeypatch):
+    monkeypatch.setattr(settings, "masc_api_key", "super-secret-token")
+    payload = {
+        "task_description": "Test auth",
+        "config": base_masc_config.model_dump(),
+    }
+
+    # Missing Authorization header -> 401
+    resp_unauth = test_client.post("/v1/masc/execute", json=payload)
+    assert resp_unauth.status_code == 401
+
+    # Invalid token -> 403
+    resp_forbidden = test_client.post(
+        "/v1/masc/execute",
+        json=payload,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert resp_forbidden.status_code == 403
+
+
+def test_execute_masc_sse_stream_and_redaction(test_client, base_masc_config, monkeypatch):
+    async def fake_workflow(task_description, config, thread_id):
+        yield {
+            "propose": {
+                "current_artifact": Artifact(
+                    version="1.0_proposal",
+                    content="Initial proposal text",
+                    history=["Initial proposal"],
+                ),
+                "config": config,
+                "current_turn": 1,
+            }
+        }
+        yield {
+            "synthesize_sequential": {
+                "current_artifact": Artifact(
+                    version="2.0_sequential",
+                    content="Hardened final text",
+                    history=["Initial proposal", "[Turn 1] Hardened against: DA"],
+                ),
+                "current_turn": 2,
+            }
+        }
+
+    monkeypatch.setattr("src.entrypoints.api_server.execute_masc_workflow", fake_workflow)
+
+    payload = {
+        "task_description": "Test streaming endpoint",
+        "config": base_masc_config.model_dump(),
+    }
+
+    response = test_client.post("/v1/masc/execute", json=payload)
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+
+    events = [
+        line.removeprefix("data: ")
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert events[-1] == "[DONE]"
+
+    first_event = json.loads(events[0])
+    assert first_event["node_executed"] == "propose"
+    assert first_event["current_turn"] == 1
+    # Verify API keys are stripped from streamed config state
+    assert "api_key" not in first_event["state_data"]["config"]["proposer"]["llm_config"]
+
+    second_event = json.loads(events[1])
+    assert second_event["node_executed"] == "synthesize_sequential"
+    # Verify post-synthesis turn is normalized back to the active turn (1)
+    assert second_event["current_turn"] == 1

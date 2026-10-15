@@ -1,5 +1,4 @@
 import logging
-import traceback
 import uuid
 from contextlib import asynccontextmanager
 
@@ -7,16 +6,21 @@ import gradio as gr
 from fastapi import FastAPI
 
 from src.config.settings import settings
-from src.core.engine import execute_masc_workflow, close_pg_pool
+from src.core.engine import close_pg_pool, execute_masc_workflow
 from src.core.personas import ADVERSARY_PERSONAS
-from src.core.state import MASCConfig, PersonaConfig, LLMConfig
+from src.core.state import LLMConfig, MASCConfig, PersonaConfig
+from src.utils.model_fetcher import FALLBACK_MODELS, fetch_available_models
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=True)):
     """Orchestrates the MASC process as an async generator, updating Gradio UI."""
     try:
+        if not task_desc or not task_desc.strip():
+            raise gr.Error("Task Description cannot be empty.")
+
         progress(0, desc="Parsing workflow configuration...")
 
         # 1. Unpack Proposer (Index 0 to 5)
@@ -26,7 +30,7 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
             base_url=config_inputs[2] or None,
             model_name=config_inputs[3],
             temperature=config_inputs[4],
-            max_tokens=config_inputs[5]
+            max_tokens=config_inputs[5],
         )
         proposer_cfg = PersonaConfig(persona_name="Proposer", llm_config=proposer_llm)
 
@@ -37,7 +41,7 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
             base_url=config_inputs[8] or None,
             model_name=config_inputs[9],
             temperature=config_inputs[10],
-            max_tokens=config_inputs[11]
+            max_tokens=config_inputs[11],
         )
         synthesizer_cfg = PersonaConfig(persona_name="Synthesizer", llm_config=synth_llm)
 
@@ -49,7 +53,7 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
         adv_inputs = config_inputs[14:]
 
         for i in range(settings.max_adversaries):
-            chunk = adv_inputs[i * 7: (i + 1) * 7]
+            chunk = adv_inputs[i * 7 : (i + 1) * 7]
             if chunk[0] != "NONE":
                 adv_llm_cfg = LLMConfig(
                     provider=chunk[1],
@@ -57,7 +61,7 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
                     base_url=chunk[3] or None,
                     model_name=chunk[4],
                     temperature=chunk[5],
-                    max_tokens=chunk[6]
+                    max_tokens=chunk[6],
                 )
                 adversary_cfgs.append(PersonaConfig(persona_name=chunk[0], llm_config=adv_llm_cfg))
 
@@ -69,7 +73,7 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
             synthesizer=synthesizer_cfg,
             adversaries=adversary_cfgs,
             synthesis_protocol=synthesis_protocol_input,
-            max_turns=max_turns_input
+            max_turns=max_turns_input,
         )
 
         progress(0.05, desc="Compiling MASC Graph & Connecting to Telemetry...")
@@ -84,14 +88,21 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
         async for state in execute_masc_workflow(task_desc, masc_config, thread_id):
 
             node_name = list(state.keys())[0]
-            current_turn = state[node_name].get("current_turn", 1)
+            raw_turn = state[node_name].get("current_turn", 1)
+            active_turn = (
+                raw_turn - 1
+                if node_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
+                else raw_turn
+            )
 
-            base_progress = (current_turn - 1) / max_turns_input
+            base_progress = (active_turn - 1) / max_turns_input
             turn_weight = 1.0 / max_turns_input
 
             if "propose" in state:
-                progress(base_progress + (turn_weight * 0.2),
-                         desc=f"Cycle {current_turn}: Generating Initial Proposal...")
+                progress(
+                    min(0.99, base_progress + (turn_weight * 0.2)),
+                    desc=f"Cycle {active_turn}: Initial Proposal Generated.",
+                )
 
                 initial_proposal_content = state["propose"]["current_artifact"].content
                 history = state["propose"]["current_artifact"].history
@@ -100,8 +111,10 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
                 yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
             if "adversarial_analysis" in state:
-                progress(base_progress + (turn_weight * 0.6),
-                         desc=f"Cycle {current_turn}: Adversarial analysis complete.")
+                progress(
+                    min(0.99, base_progress + (turn_weight * 0.6)),
+                    desc=f"Cycle {active_turn}: Adversarial analysis complete.",
+                )
 
                 critiques = state["adversarial_analysis"].get("critiques_collection")
                 if critiques and critiques.critiques:
@@ -112,7 +125,10 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
                 yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
             if "synthesize_sequential" in state or "synthesize_architect" in state:
-                progress(base_progress + (turn_weight * 0.9), desc=f"Cycle {current_turn}: Synthesis complete.")
+                progress(
+                    min(0.99, base_progress + (turn_weight * 0.9)),
+                    desc=f"Cycle {active_turn}: Synthesis complete.",
+                )
                 synthesis_output = state.get("synthesize_sequential") or state.get("synthesize_architect")
 
                 final_synthesis_content = synthesis_output["current_artifact"].content
@@ -121,11 +137,13 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
 
                 yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
-        progress(1.0, desc=f"Workflow Finished after {max_turns_input} cycles!")
+        progress(1.0, desc=f"Workflow Finished after {max_turns_input} cycle(s)!")
 
+    except gr.Error:
+        raise
     except Exception as e:
-        error_msg = f"An error occurred: {e}\n\n{traceback.format_exc()}"
-        raise gr.Error(error_msg)
+        logger.exception(f"Gradio execution error: {e}")
+        raise gr.Error(f"Execution failed: {e}")
 
 
 def create_persona_ui(persona_name, is_adversary=False):
@@ -133,44 +151,63 @@ def create_persona_ui(persona_name, is_adversary=False):
         persona_selector = None
         if is_adversary:
             persona_selector = gr.Dropdown(
-                label="Persona Type", choices=["NONE"] + list(ADVERSARY_PERSONAS.keys()), value="NONE"
+                label="Persona Type",
+                choices=["NONE"] + list(ADVERSARY_PERSONAS.keys()),
+                value="NONE",
             )
 
-        provider = gr.Dropdown(label="LLM Provider", choices=["OpenAI", "Anthropic", "Google", "Ollama"],
-                               value=settings.default_provider)
+        provider = gr.Dropdown(
+            label="LLM Provider",
+            choices=["OpenAI", "Anthropic", "Google", "Ollama"],
+            value=settings.default_provider,
+        )
 
         with gr.Row():
-            from src.utils.model_fetcher import FALLBACK_MODELS
             model = gr.Dropdown(
                 label="Model Name",
                 choices=FALLBACK_MODELS.get(settings.default_provider, []),
                 value=settings.default_model,
                 allow_custom_value=True,
-                scale=4
+                scale=4,
             )
             refresh_btn = gr.Button("🔄 Fetch Latest", scale=1)
 
-        api_key = gr.Textbox(label="API Key", type="password",
-                             placeholder="Leave blank for env vars (Not needed for Ollama)")
-        base_url = gr.Textbox(label="Base URL",
-                              placeholder="Optional: http://localhost:11434 for Ollama or custom endpoints",
-                              visible=False)
-        temp = gr.Slider(label="Temperature", minimum=0.0, maximum=1.5, step=0.1, value=settings.default_temperature)
-        max_tokens = gr.Slider(label="Max Tokens", minimum=500, maximum=16000, step=500,
-                               value=settings.default_max_tokens)
+        api_key = gr.Textbox(
+            label="API Key",
+            type="password",
+            placeholder="Leave blank for env vars (Not needed for Ollama)",
+        )
+        base_url = gr.Textbox(
+            label="Base URL",
+            placeholder="Optional: http://localhost:11434 for Ollama or custom endpoints",
+            visible=settings.default_provider in ["Ollama", "OpenAI"],
+        )
+        temp = gr.Slider(
+            label="Temperature",
+            minimum=0.0,
+            maximum=1.5,
+            step=0.1,
+            value=settings.default_temperature,
+        )
+        max_tokens = gr.Slider(
+            label="Max Tokens",
+            minimum=500,
+            maximum=16000,
+            step=500,
+            value=settings.default_max_tokens,
+        )
 
         def update_provider_settings(prov):
             choices = FALLBACK_MODELS.get(prov, [])
             show_base_url = prov in ["Ollama", "OpenAI"]
             return (
                 gr.update(choices=choices, value=choices[0] if choices else None),
-                gr.update(visible=show_base_url)
+                gr.update(visible=show_base_url),
             )
 
         provider.change(fn=update_provider_settings, inputs=provider, outputs=[model, base_url])
 
         async def trigger_model_fetch(prov, key, url):
-            from src.utils.model_fetcher import fetch_available_models
             new_models = await fetch_available_models(prov, key, url)
             return gr.update(choices=new_models, value=new_models[0] if new_models else None)
 
@@ -179,7 +216,7 @@ def create_persona_ui(persona_name, is_adversary=False):
         if is_adversary:
             def toggle_adversary_inputs(persona_type):
                 disabled = persona_type == "NONE"
-                return [gr.update(disabled=disabled)] * 6
+                return [gr.update(interactive=not disabled)] * 6
 
             persona_selector.change(
                 fn=toggle_adversary_inputs,
@@ -221,18 +258,18 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
 
                     synthesis_protocol_selector = gr.Radio(
                         label="Synthesis Protocol",
-                        choices=['Sequential Refinement', 'Architect'],
-                        value='Sequential Refinement'
+                        choices=["Sequential Refinement", "Architect"],
+                        value="Sequential Refinement",
                     )
                     all_ui_inputs.append(synthesis_protocol_selector)
 
                     max_turns_input = gr.Slider(
                         label="Max Critique Cycles",
                         minimum=1,
-                        maximum=10,
+                        maximum=settings.max_turns_limit,
                         step=1,
                         value=1,
-                        info="Number of times the artifact loops back through adversarial critique."
+                        info="Number of times the artifact loops back through adversarial critique.",
                     )
                     all_ui_inputs.append(max_turns_input)
 

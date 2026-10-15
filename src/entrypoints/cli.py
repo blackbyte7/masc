@@ -5,24 +5,30 @@ import sys
 import uuid
 
 from src.config.settings import settings
-from src.core.engine import execute_masc_workflow
-from src.core.state import MASCConfig, PersonaConfig, LLMConfig
+from src.core.engine import close_pg_pool, execute_masc_workflow
+from src.core.state import LLMConfig, MASCConfig, PersonaConfig
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def generate_template(filepath: str):
     """Generates a boilerplate JSON configuration file for the user."""
-    default_llm = LLMConfig(provider=settings.default_provider, api_key="env", model_name=settings.default_model)
+    default_llm = LLMConfig(
+        provider=settings.default_provider,
+        api_key="",
+        model_name=settings.default_model,
+        temperature=settings.default_temperature,
+        max_tokens=settings.default_max_tokens,
+    )
     template = MASCConfig(
         proposer=PersonaConfig(persona_name="Proposer", llm_config=default_llm),
         synthesizer=PersonaConfig(persona_name="Synthesizer", llm_config=default_llm),
         adversaries=[PersonaConfig(persona_name="DA", llm_config=default_llm)],
         synthesis_protocol="Sequential Refinement",
-        max_turns=2  # Added max_turns to the template
+        max_turns=2,
     )
 
-    with open(filepath, 'w') as f:
+    with open(filepath, "w", encoding="utf-8") as f:
         f.write(template.model_dump_json(indent=4))
     print(f"✅ Configuration template generated at: {filepath}")
 
@@ -33,7 +39,7 @@ async def run_cli(task: str, config_path: str):
     print("=" * 50)
 
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             config = MASCConfig.model_validate_json(f.read())
     except Exception as e:
         print(f"❌ Failed to parse config file '{config_path}': {e}")
@@ -52,11 +58,16 @@ async def run_cli(task: str, config_path: str):
             step_name = list(state.keys())[0]
             node_state = state[step_name]
 
-            current_turn = node_state.get("current_turn", "?")
+            raw_turn = node_state.get("current_turn", 1)
+            display_turn = (
+                raw_turn - 1
+                if step_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
+                else raw_turn
+            )
 
-            print(f"🔄 [Turn {current_turn}] Executed Node: [ {step_name.upper()} ]")
+            print(f"🔄 [Turn {display_turn}] Executed Node: [ {step_name.upper()} ]")
 
-            if step_name in ["synthesize_sequential", "synthesize_architect"]:
+            if step_name in ("synthesize_sequential", "synthesize_architect"):
                 final_content = node_state["current_artifact"].content
 
         print("\n" + "=" * 50)
@@ -68,14 +79,20 @@ async def run_cli(task: str, config_path: str):
     except Exception as e:
         print(f"\n❌ Execution Error: {e}")
         sys.exit(1)
+    finally:
+        await close_pg_pool()
 
 
 def main():
     parser = argparse.ArgumentParser(description="MASC General-Purpose Dialectical AI")
     parser.add_argument("--task", type=str, help="The prompt or goal for the MASC workflow.")
     parser.add_argument("--config", type=str, help="Path to the JSON configuration file.")
-    parser.add_argument("--generate-template", type=str, metavar="FILEPATH",
-                        help="Generate a base JSON configuration file.")
+    parser.add_argument(
+        "--generate-template",
+        type=str,
+        metavar="FILEPATH",
+        help="Generate a base JSON configuration file.",
+    )
 
     args = parser.parse_args()
 

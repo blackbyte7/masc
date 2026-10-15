@@ -4,18 +4,17 @@ set -e
 
 echo "🔍 Checking database readiness..."
 
-# We use an inline Python script with psycopg to poll the database.
-# This avoids needing to install 'postgresql-client' or 'netcat' in the final Docker image.
+# Inline Python script with psycopg to poll the database
 python -c "
 import os, sys, time
 try:
     import psycopg
 except ImportError:
-    sys.exit(0)  # Skip if psycopg isn't installed yet (e.g., during builds)
+    sys.exit(0)
 
 db_url = os.environ.get('DATABASE_URL')
 if not db_url or not db_url.startswith('postgres'):
-    sys.exit(0)  # Skip if not using PostgreSQL
+    sys.exit(0)
 
 retries = 30
 while retries > 0:
@@ -32,5 +31,5 @@ print('❌ Timeout waiting for PostgreSQL.')
 sys.exit(1)
 "
 
-# Execute the main container command (e.g., uvicorn, python main.py, etc.)
+# Execute the main container command
 exec "$@"

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   masc-api:
     build: .
@@ -8,14 +6,18 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - DATABASE_URL=postgresql://masc_user:masc_pass@postgres:5432/masc_db
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-masc_user}:${POSTGRES_PASSWORD:-masc_pass}@postgres:5432/${POSTGRES_DB:-masc_db}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      - MASC_API_KEY=${MASC_API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
-    command: [ "python", "main.py", "--mode", "api" ]
+    command: ["python", "main.py", "--mode", "api"]
 
   masc-ui:
     build: .
@@ -24,25 +26,30 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - DATABASE_URL=postgresql://masc_user:masc_pass@postgres:5432/masc_db
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-masc_user}:${POSTGRES_PASSWORD:-masc_pass}@postgres:5432/${POSTGRES_DB:-masc_db}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
     depends_on:
       postgres:
         condition: service_healthy
-    command: [ "python", "main.py", "--mode", "ui" ]
+    command: ["python", "main.py", "--mode", "ui"]
 
   postgres:
     image: postgres:15-alpine
     environment:
-      - POSTGRES_USER=masc_user
-      - POSTGRES_PASSWORD=masc_pass
-      - POSTGRES_DB=masc_db
+      - POSTGRES_USER=${POSTGRES_USER:-masc_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-masc_pass}
+      - POSTGRES_DB=${POSTGRES_DB:-masc_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U masc_user -d masc_db" ]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-masc_user} -d ${POSTGRES_DB:-masc_db}"]
       interval: 5s
       timeout: 5s
       retries: 5

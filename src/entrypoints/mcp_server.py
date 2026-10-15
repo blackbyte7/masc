@@ -3,10 +3,11 @@ import uuid
 
 from mcp.server.fastmcp import FastMCP
 
+from src.config.settings import settings
 from src.core.engine import execute_masc_workflow
 from src.core.state import MASCConfig
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 mcp = FastMCP("MASC-Dialectics")
 
@@ -22,6 +23,11 @@ async def trigger_masc_audit(task_description: str, config_json: str) -> str:
     """
     try:
         config = MASCConfig.model_validate_json(config_json)
+        if len(config.adversaries) > settings.max_adversaries:
+            return f"MASC Validation Error: Exceeded max adversaries ({settings.max_adversaries})."
+        if config.max_turns > settings.max_turns_limit:
+            return f"MASC Validation Error: Exceeded max turns limit ({settings.max_turns_limit})."
+
         thread_id = str(uuid.uuid4())
 
         final_state = None
