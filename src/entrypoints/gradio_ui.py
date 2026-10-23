@@ -5,9 +5,9 @@ from contextlib import asynccontextmanager
 import gradio as gr
 from fastapi import FastAPI
 
-from src.config.settings import settings
+from src.config.settings import settings, validate_base_url
 from src.core.engine import close_pg_pool, execute_masc_workflow
-from src.core.personas import ADVERSARY_PERSONAS
+from src.core.personas import ADVERSARY_PERSONAS, load_personas
 from src.core.state import LLMConfig, MASCConfig, PersonaConfig
 from src.utils.model_fetcher import FALLBACK_MODELS, fetch_available_models
 
@@ -20,14 +20,17 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
     try:
         if not task_desc or not task_desc.strip():
             raise gr.Error("Task Description cannot be empty.")
+        if len(task_desc) > settings.max_task_length:
+            raise gr.Error(f"Task Description exceeds maximum length ({settings.max_task_length} characters).")
 
         progress(0, desc="Parsing workflow configuration...")
 
         # 1. Unpack Proposer (Index 0 to 5)
+        proposer_base_url = validate_base_url(config_inputs[2], settings) if config_inputs[2] else None
         proposer_llm = LLMConfig(
             provider=config_inputs[0],
             api_key=config_inputs[1] or "",
-            base_url=config_inputs[2] or None,
+            base_url=proposer_base_url,
             model_name=config_inputs[3],
             temperature=config_inputs[4],
             max_tokens=config_inputs[5],
@@ -35,10 +38,11 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
         proposer_cfg = PersonaConfig(persona_name="Proposer", llm_config=proposer_llm)
 
         # 2. Unpack Synthesizer (Index 6 to 11)
+        synth_base_url = validate_base_url(config_inputs[8], settings) if config_inputs[8] else None
         synth_llm = LLMConfig(
             provider=config_inputs[6],
             api_key=config_inputs[7] or "",
-            base_url=config_inputs[8] or None,
+            base_url=synth_base_url,
             model_name=config_inputs[9],
             temperature=config_inputs[10],
             max_tokens=config_inputs[11],
@@ -55,10 +59,11 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
         for i in range(settings.max_adversaries):
             chunk = adv_inputs[i * 7 : (i + 1) * 7]
             if chunk[0] != "NONE":
+                adv_base_url = validate_base_url(chunk[3], settings) if chunk[3] else None
                 adv_llm_cfg = LLMConfig(
                     provider=chunk[1],
                     api_key=chunk[2] or "",
-                    base_url=chunk[3] or None,
+                    base_url=adv_base_url,
                     model_name=chunk[4],
                     temperature=chunk[5],
                     max_tokens=chunk[6],
@@ -147,12 +152,13 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
 
 
 def create_persona_ui(persona_name, is_adversary=False):
+    available_personas = {**ADVERSARY_PERSONAS, **load_personas()}
     with gr.Accordion(f"{persona_name} Configuration", open=True):
         persona_selector = None
         if is_adversary:
             persona_selector = gr.Dropdown(
                 label="Persona Type",
-                choices=["NONE"] + list(ADVERSARY_PERSONAS.keys()),
+                choices=["NONE"] + list(available_personas.keys()),
                 value="NONE",
             )
 
@@ -179,7 +185,7 @@ def create_persona_ui(persona_name, is_adversary=False):
         )
         base_url = gr.Textbox(
             label="Base URL",
-            placeholder="Optional: http://localhost:11434 for Ollama or custom endpoints",
+            placeholder="Optional: http://localhost:11434 for Ollama or allowlisted endpoints",
             visible=settings.default_provider in ["Ollama", "OpenAI"],
         )
         temp = gr.Slider(

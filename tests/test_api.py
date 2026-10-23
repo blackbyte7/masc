@@ -54,6 +54,32 @@ def test_execute_masc_unknown_persona(test_client, base_masc_config):
     assert "Unknown adversary persona" in response.json()["detail"]
 
 
+def test_execute_masc_ssrf_base_url_rejected(test_client, base_masc_config):
+    base_masc_config.proposer.llm_config.base_url = "http://169.254.169.254/latest/meta-data"
+    payload = {
+        "task_description": "Test SSRF protection",
+        "config": base_masc_config.model_dump(),
+    }
+
+    response = test_client.post("/v1/masc/execute", json=payload)
+    assert response.status_code == 400
+    assert "Disallowed base_url" in response.json()["detail"]
+
+
+def test_execute_masc_custom_base_url_without_key_rejected(test_client, base_masc_config, monkeypatch):
+    monkeypatch.setattr(settings, "allow_custom_base_urls", True)
+    base_masc_config.proposer.llm_config.base_url = "https://example.com/v1"
+    base_masc_config.proposer.llm_config.api_key = ""
+    payload = {
+        "task_description": "Test env key exfiltration guard",
+        "config": base_masc_config.model_dump(),
+    }
+
+    response = test_client.post("/v1/masc/execute", json=payload)
+    assert response.status_code == 400
+    assert "Explicit API key is required" in response.json()["detail"]
+
+
 def test_execute_masc_auth_guard(test_client, base_masc_config, monkeypatch):
     monkeypatch.setattr(settings, "masc_api_key", "super-secret-token")
     payload = {
@@ -126,3 +152,8 @@ def test_execute_masc_sse_stream_and_redaction(test_client, base_masc_config, mo
     assert second_event["node_executed"] == "synthesize_sequential"
     # Verify post-synthesis turn is normalized back to the active turn (1)
     assert second_event["current_turn"] == 1
+
+
+def test_get_thread_state_not_found(test_client):
+    response = test_client.get("/v1/masc/threads/non-existent-thread-id")
+    assert response.status_code == 404

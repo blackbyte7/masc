@@ -49,3 +49,9 @@ async def test_model_fetcher_returns_fallbacks_when_no_key():
     for provider in ("OpenAI", "Anthropic", "Google"):
         models = await fetch_available_models(provider, api_key="")
         assert models == FALLBACK_MODELS[provider]
+
+
+@pytest.mark.asyncio
+async def test_model_fetcher_blocks_disallowed_base_url():
+    models = await fetch_available_models("Ollama", base_url="http://169.254.169.254/latest")
+    assert models == FALLBACK_MODELS["Ollama"]

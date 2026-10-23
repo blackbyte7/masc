@@ -3,6 +3,8 @@ from typing import List
 
 import httpx
 
+from src.config.settings import validate_base_url
+
 logger = logging.getLogger(__name__)
 
 # Fallbacks ensure the UI never breaks if an API key is missing or invalid
@@ -19,12 +21,15 @@ async def fetch_available_models(provider: str, api_key: str = "", base_url: str
     timeout = httpx.Timeout(10.0)
 
     try:
+        validated_url = validate_base_url(base_url) if base_url else None
+
         async with httpx.AsyncClient(timeout=timeout) as client:
             if provider == "OpenAI":
                 if not api_key:
                     return FALLBACK_MODELS["OpenAI"]
                 headers = {"Authorization": f"Bearer {api_key}"}
-                response = await client.get("https://api.openai.com/v1/models", headers=headers)
+                target_url = f"{validated_url}/v1/models" if validated_url else "https://api.openai.com/v1/models"
+                response = await client.get(target_url, headers=headers)
                 response.raise_for_status()
                 data = response.json()
                 # Filter for core chat/reasoning models
@@ -63,7 +68,7 @@ async def fetch_available_models(provider: str, api_key: str = "", base_url: str
                 return models or FALLBACK_MODELS["Google"]
 
             elif provider == "Ollama":
-                url = base_url.rstrip("/") if base_url else "http://localhost:11434"
+                url = validated_url if validated_url else "http://localhost:11434"
                 response = await client.get(f"{url}/api/tags")
                 response.raise_for_status()
                 data = response.json()

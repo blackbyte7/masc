@@ -1,16 +1,22 @@
+import asyncio
 import json
 import logging
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.config.settings import settings
-from src.core.engine import close_pg_pool, execute_masc_workflow
+from src.config.settings import settings, validate_base_url
+from src.core.engine import (
+    close_pg_pool,
+    execute_masc_workflow,
+    get_thread_checkpoint_state,
+)
 from src.core.personas import ADVERSARY_PERSONAS, load_personas
 from src.core.state import MASCConfig
 
@@ -26,7 +32,7 @@ async def lifespan(app: FastAPI):
     await close_pg_pool()
 
 
-app = FastAPI(title="MASC API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="MASC API", version="2.1.0", lifespan=lifespan)
 
 allow_origins = settings.cors_origins
 app.add_middleware(
@@ -39,12 +45,20 @@ app.add_middleware(
 
 
 class MASCRequest(BaseModel):
-    task_description: str = Field(min_length=1, description="The prompt or goal for the MASC workflow.")
+    task_description: str = Field(
+        min_length=1,
+        max_length=settings.max_task_length,
+        description="The prompt or goal for the MASC workflow.",
+    )
     config: MASCConfig
+    thread_id: Optional[str] = Field(
+        default=None,
+        description="Optional thread ID for correlating or inspecting checkpointed execution state.",
+    )
 
 
 async def verify_api_key(authorization: Optional[str] = Header(default=None)):
-    """Enforces Bearer token authentication when MASC_API_KEY is configured."""
+    """Enforces constant-time Bearer token authentication when MASC_API_KEY is configured."""
     if not settings.masc_api_key:
         return
     if not authorization or not authorization.startswith("Bearer "):
@@ -53,47 +67,101 @@ async def verify_api_key(authorization: Optional[str] = Header(default=None)):
             detail="Missing or invalid Authorization Bearer token.",
         )
     token = authorization.removeprefix("Bearer ").strip()
-    if token != settings.masc_api_key:
+    if not secrets.compare_digest(token.encode("utf-8"), settings.masc_api_key.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key.",
         )
 
 
-async def stream_graph_execution(task_description: str, config: MASCConfig, thread_id: str):
-    try:
-        async for state_update in execute_masc_workflow(task_description, config, thread_id):
-            node_name = list(state_update.keys())[0]
-            node_data = state_update[node_name]
+def _validate_config_security(config: MASCConfig):
+    """Validates all persona LLM configurations for SSRF and API key exfiltration risks."""
+    all_personas = [config.proposer, config.synthesizer, *config.adversaries]
+    for persona in all_personas:
+        llm_cfg = persona.llm_config
+        try:
+            validated_url = validate_base_url(llm_cfg.base_url, settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-            safe_state = {}
-            for key, value in node_data.items():
-                if hasattr(value, "redacted_dump"):
-                    safe_state[key] = value.redacted_dump()
-                elif hasattr(value, "model_dump"):
-                    safe_state[key] = value.model_dump()
-                else:
-                    safe_state[key] = value
-
-            raw_turn = node_data.get("current_turn", 1)
-            executed_turn = (
-                raw_turn - 1
-                if node_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
-                else raw_turn
+        raw_key = (llm_cfg.api_key or "").strip()
+        if validated_url and llm_cfg.provider != "Ollama" and raw_key in ("", "env"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Explicit API key is required when specifying a custom base_url "
+                    f"for provider '{llm_cfg.provider}'."
+                ),
             )
 
-            payload = {
-                "thread_id": thread_id,
-                "node_executed": node_name,
-                "current_turn": executed_turn,
-                "state_data": safe_state,
-            }
 
-            yield f"data: {json.dumps(payload)}\n\n"
-        yield "data: [DONE]\n\n"
-    except Exception as e:
-        logger.exception(f"Workflow execution error on thread {thread_id}: {e}")
-        yield f"data: {json.dumps({'error': 'Workflow execution failed. Check server logs for details.'})}\n\n"
+async def stream_graph_execution(
+    task_description: str,
+    config: MASCConfig,
+    thread_id: str,
+    http_request: Optional[Request] = None,
+):
+    queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+    async def _producer():
+        try:
+            async for state_update in execute_masc_workflow(task_description, config, thread_id):
+                node_name = list(state_update.keys())[0]
+                node_data = state_update[node_name]
+
+                safe_state = {}
+                for key, value in node_data.items():
+                    if hasattr(value, "redacted_dump"):
+                        safe_state[key] = value.redacted_dump()
+                    elif hasattr(value, "model_dump"):
+                        safe_state[key] = value.model_dump()
+                    else:
+                        safe_state[key] = value
+
+                raw_turn = node_data.get("current_turn", 1)
+                executed_turn = (
+                    raw_turn - 1
+                    if node_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
+                    else raw_turn
+                )
+
+                payload = {
+                    "thread_id": thread_id,
+                    "node_executed": node_name,
+                    "current_turn": executed_turn,
+                    "state_data": safe_state,
+                }
+
+                await queue.put(f"data: {json.dumps(payload)}\n\n")
+            await queue.put("data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            logger.info(f"Client disconnected; cancelled workflow on thread {thread_id}.")
+            raise
+        except Exception as e:
+            logger.exception(f"Workflow execution error on thread {thread_id}: {e}")
+            await queue.put(
+                f"data: {json.dumps({'error': 'Workflow execution failed. Check server logs for details.'})}\n\n"
+            )
+        finally:
+            await queue.put(None)
+
+    producer_task = asyncio.create_task(_producer())
+    try:
+        while True:
+            if http_request is not None and await http_request.is_disconnected():
+                producer_task.cancel()
+                break
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=settings.sse_heartbeat_interval)
+                if item is None:
+                    break
+                yield item
+            except asyncio.TimeoutError:
+                # Emit SSE comment heartbeat to keep reverse proxies and load balancers alive
+                yield ": keep-alive\n\n"
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
 
 
 @app.get("/health")
@@ -101,15 +169,23 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/v1/masc/threads/{thread_id}", dependencies=[Depends(verify_api_key)])
+async def get_thread_state(thread_id: str):
+    state = await get_thread_checkpoint_state(thread_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found.")
+    return state
+
+
 @app.post("/v1/masc/execute", dependencies=[Depends(verify_api_key)])
-async def execute_workflow(request: MASCRequest):
-    if len(request.config.adversaries) > settings.max_adversaries:
+async def execute_workflow(masc_request: MASCRequest, request: Request):
+    if len(masc_request.config.adversaries) > settings.max_adversaries:
         raise HTTPException(
             status_code=400,
             detail=f"Exceeded max adversaries ({settings.max_adversaries})",
         )
 
-    if request.config.max_turns > settings.max_turns_limit:
+    if masc_request.config.max_turns > settings.max_turns_limit:
         raise HTTPException(
             status_code=400,
             detail=f"Exceeded max turns limit ({settings.max_turns_limit})",
@@ -118,7 +194,7 @@ async def execute_workflow(request: MASCRequest):
     available_personas = {**ADVERSARY_PERSONAS, **load_personas()}
     invalid_personas = [
         adv.persona_name
-        for adv in request.config.adversaries
+        for adv in masc_request.config.adversaries
         if adv.persona_name not in available_personas
     ]
     if invalid_personas:
@@ -127,9 +203,11 @@ async def execute_workflow(request: MASCRequest):
             detail=f"Unknown adversary persona(s): {invalid_personas}",
         )
 
-    thread_id = str(uuid.uuid4())
+    _validate_config_security(masc_request.config)
+
+    thread_id = masc_request.thread_id or str(uuid.uuid4())
     return StreamingResponse(
-        stream_graph_execution(request.task_description, request.config, thread_id),
+        stream_graph_execution(masc_request.task_description, masc_request.config, thread_id, request),
         media_type="text/event-stream",
     )
 

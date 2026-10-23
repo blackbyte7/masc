@@ -72,16 +72,19 @@ class CritiqueItem(BaseModel):
 
 class CritiqueLLMOutput(BaseModel):
     """Schema used exclusively for structured LLM generation by an adversary."""
-    payload: Annotated[List[CritiqueItem], Field(min_length=1)] = Field(
-        description="A non-empty list of specific issues identified during the audit."
+
+    payload: List[CritiqueItem] = Field(
+        default_factory=list,
+        description="A list of specific issues identified during the audit. Return an empty list if no valid issues exist.",
     )
 
 
 class Critique(BaseModel):
     source_adversary: str = Field(description="The name of the adversary generating this critique.")
     critique_type: Literal["CONSTRUCTIVE", "ANTAGONISTIC"] = Field(description="The nature of the critique.")
-    payload: Annotated[List[CritiqueItem], Field(min_length=1)] = Field(
-        description="A list of specific issues identified."
+    payload: List[CritiqueItem] = Field(
+        default_factory=list,
+        description="A list of specific issues identified.",
     )
 
 

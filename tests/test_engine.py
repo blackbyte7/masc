@@ -58,6 +58,20 @@ async def test_loop_continuation(base_masc_config):
     assert should_continue_loop(state) == "__end__"
 
 
+@pytest.mark.asyncio
+async def test_early_convergence_when_no_actionable_critiques(base_masc_config):
+    base_masc_config.max_turns = 5
+    state: MASCState = {
+        "task_description": "Test",
+        "config": base_masc_config,
+        "current_artifact": Artifact(version="2.0", content="hardened"),
+        "current_turn": 2,
+        "critiques_collection": CritiquesCollection(critiques=[]),
+    }
+    # Even though current_turn (2) <= max_turns (5), empty critiques trigger early convergence
+    assert should_continue_loop(state) == "__end__"
+
+
 def test_get_llm_treats_env_placeholder_as_none(base_masc_config, monkeypatch):
     nodes = MASCNodes(settings)
     captured_kwargs = {}
@@ -73,6 +87,15 @@ def test_get_llm_treats_env_placeholder_as_none(base_masc_config, monkeypatch):
     base_masc_config.proposer.llm_config.api_key = "env"
     nodes._get_llm(base_masc_config.proposer)
     assert captured_kwargs["api_key"] is None
+
+
+def test_get_llm_blocks_env_key_exfiltration_with_custom_base_url(base_masc_config):
+    nodes = MASCNodes(settings)
+    base_masc_config.proposer.llm_config.api_key = ""
+    base_masc_config.proposer.llm_config.base_url = "http://localhost:11434"
+
+    with pytest.raises(ValueError, match="Explicit API key is required"):
+        nodes._get_llm(base_masc_config.proposer)
 
 
 @pytest.mark.asyncio
@@ -175,6 +198,39 @@ async def test_adversarial_analysis_node(base_masc_config, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_adversarial_analysis_handles_curly_braces_in_system_prompt(base_masc_config, monkeypatch):
+    nodes = MASCNodes(settings)
+    expected_output = CritiqueLLMOutput(
+        payload=[
+            CritiqueItem(
+                severity="MEDIUM",
+                description="Missing JSON validation.",
+                recommendation="Validate against schema.",
+            )
+        ]
+    )
+
+    mock_llm = MagicMock()
+    mock_llm.with_structured_output.return_value = RunnableLambda(lambda _x: expected_output)
+    monkeypatch.setattr(nodes, "_get_llm", lambda _cfg: mock_llm)
+
+    # Ensure unescaped JSON braces in system_prompt do not trigger LangChain KeyError
+    persona_with_braces = {
+        "critique_type": "CONSTRUCTIVE",
+        "system_prompt": 'Audit this JSON structure: {"user_id": 123, "role": "admin"}',
+    }
+    critique = await nodes._run_single_adversary(
+        adv_config=base_masc_config.adversaries[0],
+        name="CustomJSONAuditor",
+        persona=persona_with_braces,
+        task_description="Build a user service",
+        content="Draft service",
+    )
+    assert critique.source_adversary == "CustomJSONAuditor"
+    assert len(critique.payload) == 1
+
+
+@pytest.mark.asyncio
 async def test_adversarial_analysis_raises_when_all_fail(base_masc_config, monkeypatch):
     nodes = MASCNodes(settings)
 
@@ -245,6 +301,40 @@ async def test_synthesize_sequential_batches_per_adversary(base_masc_config, mon
     assert artifact.version == "2.0_sequential"
     assert artifact.content == "Draft after fixing all CodeAuditor issues in a single batched pass."
     assert len(artifact.history) == 4
+
+
+@pytest.mark.asyncio
+async def test_synthesize_sequential_raises_when_all_fail(base_masc_config, monkeypatch):
+    nodes = MASCNodes(settings)
+    failing_llm = RunnableLambda(lambda _x: (_ for _ in ()).throw(RuntimeError("LLM quota exceeded")))
+    monkeypatch.setattr(nodes, "_get_llm", lambda _cfg: failing_llm)
+
+    critiques = CritiquesCollection(
+        critiques=[
+            Critique(
+                source_adversary="DA",
+                critique_type="ANTAGONISTIC",
+                payload=[
+                    CritiqueItem(
+                        severity="HIGH",
+                        description="Existential critique",
+                        recommendation="Refute this ideological challenge.",
+                    )
+                ],
+            )
+        ]
+    )
+
+    state: MASCState = {
+        "task_description": "Test total synthesis failure.",
+        "config": base_masc_config,
+        "current_artifact": Artifact(version="1.0_proposal", content="v1 content", history=["Initial"]),
+        "current_turn": 1,
+        "critiques_collection": critiques,
+    }
+
+    with pytest.raises(RuntimeError, match="All sequential synthesis steps failed"):
+        await nodes.synthesize_sequential(state)
 
 
 @pytest.mark.asyncio

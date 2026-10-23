@@ -1,13 +1,20 @@
 import logging
+import sys
 import uuid
 
 from mcp.server.fastmcp import FastMCP
 
-from src.config.settings import settings
-from src.core.engine import execute_masc_workflow
+from src.config.settings import settings, validate_base_url
+from src.core.engine import close_pg_pool, execute_masc_workflow
+from src.core.personas import ADVERSARY_PERSONAS, load_personas
 from src.core.state import MASCConfig
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Strictly log to stderr so MCP stdio JSON-RPC messages on stdout are never corrupted
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 mcp = FastMCP("MASC-Dialectics")
 
@@ -22,14 +29,28 @@ async def trigger_masc_audit(task_description: str, config_json: str) -> str:
         config_json: A JSON string representing the MASCConfig schema. Must include 'max_turns' for cycle count.
     """
     try:
+        if not task_description or not task_description.strip():
+            return "MASC Validation Error: task_description cannot be empty."
+        if len(task_description) > settings.max_task_length:
+            return f"MASC Validation Error: task_description exceeds max length ({settings.max_task_length})."
+
         config = MASCConfig.model_validate_json(config_json)
         if len(config.adversaries) > settings.max_adversaries:
             return f"MASC Validation Error: Exceeded max adversaries ({settings.max_adversaries})."
         if config.max_turns > settings.max_turns_limit:
             return f"MASC Validation Error: Exceeded max turns limit ({settings.max_turns_limit})."
 
-        thread_id = str(uuid.uuid4())
+        available_personas = {**ADVERSARY_PERSONAS, **load_personas()}
+        invalid_personas = [
+            adv.persona_name for adv in config.adversaries if adv.persona_name not in available_personas
+        ]
+        if invalid_personas:
+            return f"MASC Validation Error: Unknown adversary persona(s): {invalid_personas}."
 
+        for persona in [config.proposer, config.synthesizer, *config.adversaries]:
+            validate_base_url(persona.llm_config.base_url, settings)
+
+        thread_id = str(uuid.uuid4())
         final_state = None
 
         async for state in execute_masc_workflow(task_description, config, thread_id):
@@ -54,6 +75,8 @@ async def trigger_masc_audit(task_description: str, config_json: str) -> str:
 
     except Exception as e:
         return f"MASC Execution Error: {str(e)}"
+    finally:
+        await close_pg_pool()
 
 
 if __name__ == "__main__":

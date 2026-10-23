@@ -23,7 +23,7 @@ def default_llm_config():
     return LLMConfig(
         provider="OpenAI",
         api_key="test-key-openai",
-        model_name="gpt-4o-mini",
+        model_name="gpt-5.2-pro",
         temperature=0.0,
     )
 

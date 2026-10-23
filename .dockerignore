@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+
+# Environments & Secrets
+.env
+.env.*
+.venv
+env/
+venv/
+ENV/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Local databases
+*.db
+*.sqlite3
+pgdata/
+
+# Tests & Coverage
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs & OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+README.md
