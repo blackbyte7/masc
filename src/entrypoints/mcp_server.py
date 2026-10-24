@@ -1,12 +1,14 @@
+import inspect
 import logging
 import sys
 import uuid
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from src.config.settings import settings, validate_base_url
 from src.core.engine import close_pg_pool, execute_masc_workflow
-from src.core.personas import ADVERSARY_PERSONAS, load_personas
+from src.core.personas import ADVERSARY_PERSONAS, load_personas, resolve_adversary_persona
 from src.core.state import MASCConfig
 
 # Strictly log to stderr so MCP stdio JSON-RPC messages on stdout are never corrupted
@@ -20,13 +22,18 @@ mcp = FastMCP("MASC-Dialectics")
 
 
 @mcp.tool()
-async def trigger_masc_audit(task_description: str, config_json: str) -> str:
+async def trigger_masc_audit(
+    task_description: str,
+    config_json: str,
+    initial_artifact: Optional[str] = None,
+) -> str:
     """
-    Executes a multi-agent adversarial audit on a given task or proposal over configured cycles.
+    Executes a multi-agent adversarial audit on a given task or existing artifact over configured cycles.
 
     Args:
-        task_description: The problem statement or proposal to be audited.
+        task_description: The problem statement, requirements, or audit criteria.
         config_json: A JSON string representing the MASCConfig schema. Must include 'max_turns' for cycle count.
+        initial_artifact: Optional existing code/text artifact to audit directly without running the Proposer node.
     """
     try:
         if not task_description or not task_description.strip():
@@ -41,9 +48,13 @@ async def trigger_masc_audit(task_description: str, config_json: str) -> str:
             return f"MASC Validation Error: Exceeded max turns limit ({settings.max_turns_limit})."
 
         available_personas = {**ADVERSARY_PERSONAS, **load_personas()}
-        invalid_personas = [
-            adv.persona_name for adv in config.adversaries if adv.persona_name not in available_personas
-        ]
+        invalid_personas = []
+        for adv in config.adversaries:
+            try:
+                resolve_adversary_persona(adv, available_personas)
+            except ValueError:
+                invalid_personas.append(adv.persona_name)
+
         if invalid_personas:
             return f"MASC Validation Error: Unknown adversary persona(s): {invalid_personas}."
 
@@ -53,7 +64,15 @@ async def trigger_masc_audit(task_description: str, config_json: str) -> str:
         thread_id = str(uuid.uuid4())
         final_state = None
 
-        async for state in execute_masc_workflow(task_description, config, thread_id):
+        sig = inspect.signature(execute_masc_workflow)
+        if "initial_artifact" in sig.parameters:
+            workflow_gen = execute_masc_workflow(
+                task_description, config, thread_id, initial_artifact=initial_artifact
+            )
+        else:
+            workflow_gen = execute_masc_workflow(task_description, config, thread_id)
+
+        async for state in workflow_gen:
             final_state = state
 
         if not final_state:

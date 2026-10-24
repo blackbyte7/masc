@@ -1,4 +1,5 @@
 import logging
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 
@@ -15,13 +16,24 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track_tqdm=True)):
+def verify_gradio_auth(username: str, password: str) -> bool:
+    """Authenticates Gradio UI sessions against MASC_API_KEY using constant-time comparison."""
+    if not settings.masc_api_key:
+        return True
+    return secrets.compare_digest(password.encode("utf-8"), settings.masc_api_key.encode("utf-8"))
+
+
+async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, progress=gr.Progress(track_tqdm=True)):
     """Orchestrates the MASC process as an async generator, updating Gradio UI."""
     try:
         if not task_desc or not task_desc.strip():
             raise gr.Error("Task Description cannot be empty.")
         if len(task_desc) > settings.max_task_length:
             raise gr.Error(f"Task Description exceeds maximum length ({settings.max_task_length} characters).")
+
+        cleaned_initial_artifact = (initial_artifact_text or "").strip() or None
+        if cleaned_initial_artifact and len(cleaned_initial_artifact) > settings.max_task_length:
+            raise gr.Error(f"Initial Artifact exceeds maximum length ({settings.max_task_length} characters).")
 
         progress(0, desc="Parsing workflow configuration...")
 
@@ -51,10 +63,12 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
 
         synthesis_protocol_input = config_inputs[12]
         max_turns_input = int(config_inputs[13])
+        stop_severity_input = config_inputs[14]
+        batch_constructive_input = bool(config_inputs[15])
 
-        # 3. Unpack Adversaries dynamically (Chunks of 7 starting at index 14)
+        # 3. Unpack Adversaries dynamically (Chunks of 7 starting at index 16)
         adversary_cfgs = []
-        adv_inputs = config_inputs[14:]
+        adv_inputs = config_inputs[16:]
 
         for i in range(settings.max_adversaries):
             chunk = adv_inputs[i * 7 : (i + 1) * 7]
@@ -79,21 +93,26 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
             adversaries=adversary_cfgs,
             synthesis_protocol=synthesis_protocol_input,
             max_turns=max_turns_input,
+            stop_on_max_severity=stop_severity_input,
+            batch_constructive_critiques=batch_constructive_input,
+            initial_artifact=cleaned_initial_artifact,
         )
 
         progress(0.05, desc="Compiling MASC Graph & Connecting to Telemetry...")
         thread_id = str(uuid.uuid4())
 
         # Initialize empty states for the UI
-        initial_proposal_content = ""
+        initial_proposal_content = cleaned_initial_artifact or ""
         critiques_dict = {"status": "Awaiting adversarial analysis..."}
         final_synthesis_content = ""
         history_md = "*Workflow initialized...*"
 
-        async for state in execute_masc_workflow(task_desc, masc_config, thread_id):
-
+        async for state in execute_masc_workflow(
+            task_desc, masc_config, thread_id, initial_artifact=cleaned_initial_artifact
+        ):
             node_name = list(state.keys())[0]
-            raw_turn = state[node_name].get("current_turn", 1)
+            node_state = state[node_name]
+            raw_turn = node_state.get("current_turn", 1)
             active_turn = (
                 raw_turn - 1
                 if node_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
@@ -138,7 +157,14 @@ async def run_masc_t_cycle(task_desc, *config_inputs, progress=gr.Progress(track
 
                 final_synthesis_content = synthesis_output["current_artifact"].content
                 history = synthesis_output["current_artifact"].history
-                history_md = "\n".join([f"- {entry}" for entry in history])
+                usage = synthesis_output.get("token_usage")
+                usage_line = (
+                    f"\n\n---\n**Cumulative Token Usage:** {usage.total_tokens} tokens "
+                    f"({usage.input_tokens} prompt / {usage.output_tokens} completion across {usage.llm_calls} LLM calls)"
+                    if usage
+                    else ""
+                )
+                history_md = "\n".join([f"- {entry}" for entry in history]) + usage_line
 
                 yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
@@ -252,9 +278,16 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
 
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("## 1. Task Description")
-            task_description_input = gr.Textbox(label="High-Level Goal", lines=5)
+            gr.Markdown("## 1. Task & Optional Initial Artifact")
+            task_description_input = gr.Textbox(label="High-Level Goal / Audit Criteria", lines=4)
             all_ui_inputs.append(task_description_input)
+
+            initial_artifact_input = gr.Textbox(
+                label="Existing Artifact to Audit (Optional - Leave blank to generate from scratch)",
+                placeholder="Paste existing code, architecture proposal, or policy document here to skip the Proposer step...",
+                lines=4,
+            )
+            all_ui_inputs.append(initial_artifact_input)
 
             gr.Markdown("## 2. Workflow Configuration")
             with gr.Tabs():
@@ -279,6 +312,20 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
                     )
                     all_ui_inputs.append(max_turns_input)
 
+                    stop_severity_selector = gr.Dropdown(
+                        label="Early Convergence Threshold (Stop when no issues >= severity)",
+                        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"],
+                        value="LOW",
+                    )
+                    all_ui_inputs.append(stop_severity_selector)
+
+                    batch_constructive_checkbox = gr.Checkbox(
+                        label="Batch Constructive Critiques in Sequential Mode",
+                        value=False,
+                        info="Applies all constructive fixes in a single pass per turn to reduce latency and token usage.",
+                    )
+                    all_ui_inputs.append(batch_constructive_checkbox)
+
                 with gr.TabItem("Adversaries"):
                     for i in range(settings.max_adversaries):
                         all_ui_inputs.extend(create_persona_ui(f"Adversary Slot {i + 1}", is_adversary=True))
@@ -291,9 +338,9 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
                 with gr.TabItem("Current Synthesis"):
                     final_synthesis_output = gr.Markdown(label="Hardened Artifact")
                 with gr.TabItem("Process Breakdown"):
-                    v1_proposal_output = gr.Markdown("### Initial Proposal (Cycle 1)")
+                    v1_proposal_output = gr.Markdown("### Initial Proposal / Input Artifact")
                     critiques_output = gr.JSON(label="Latest Adversarial Critiques")
-                with gr.TabItem("Refinement History Log"):
+                with gr.TabItem("Refinement History & Token Log"):
                     history_output = gr.Markdown()
 
     run_button.click(
@@ -302,7 +349,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
         outputs=[v1_proposal_output, critiques_output, final_synthesis_output, history_output],
     )
 
-fastapi_app = gr.mount_gradio_app(fastapi_app, app, path="/")
+fastapi_app = gr.mount_gradio_app(
+    fastapi_app,
+    app,
+    path="/",
+    auth=verify_gradio_auth if settings.masc_api_key else None,
+)
 
 if __name__ == "__main__":
     import uvicorn

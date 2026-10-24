@@ -54,6 +54,35 @@ def test_execute_masc_unknown_persona(test_client, base_masc_config):
     assert "Unknown adversary persona" in response.json()["detail"]
 
 
+def test_execute_masc_accepts_inline_custom_persona(test_client, base_masc_config, monkeypatch):
+    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+        yield {
+            "synthesize_sequential": {
+                "current_artifact": Artifact(
+                    version="2.0_sequential",
+                    content="Audited by inline persona",
+                    history=["[Turn 1] Audited by EphemeralFinOpsCritic"],
+                ),
+                "current_turn": 2,
+            }
+        }
+
+    monkeypatch.setattr("src.entrypoints.api_server.execute_masc_workflow", fake_workflow)
+
+    base_masc_config.adversaries[0].persona_name = "EphemeralFinOpsCritic"
+    base_masc_config.adversaries[0].critique_type = "CONSTRUCTIVE"
+    base_masc_config.adversaries[0].system_prompt = "Audit cloud architecture strictly for egress cost risks."
+
+    payload = {
+        "task_description": "Design a multi-region data replication pipeline",
+        "config": base_masc_config.model_dump(),
+    }
+
+    response = test_client.post("/v1/masc/execute", json=payload)
+    assert response.status_code == 200
+    assert "Audited by inline persona" in response.text
+
+
 def test_execute_masc_ssrf_base_url_rejected(test_client, base_masc_config):
     base_masc_config.proposer.llm_config.base_url = "http://169.254.169.254/latest/meta-data"
     payload = {

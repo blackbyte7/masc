@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import secrets
@@ -17,7 +18,7 @@ from src.core.engine import (
     execute_masc_workflow,
     get_thread_checkpoint_state,
 )
-from src.core.personas import ADVERSARY_PERSONAS, load_personas
+from src.core.personas import ADVERSARY_PERSONAS, load_personas, resolve_adversary_persona
 from src.core.state import MASCConfig
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ async def lifespan(app: FastAPI):
     await close_pg_pool()
 
 
-app = FastAPI(title="MASC API", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="MASC API", version="2.2.0", lifespan=lifespan)
 
 allow_origins = settings.cors_origins
 app.add_middleware(
@@ -51,6 +52,11 @@ class MASCRequest(BaseModel):
         description="The prompt or goal for the MASC workflow.",
     )
     config: MASCConfig
+    initial_artifact: Optional[str] = Field(
+        default=None,
+        max_length=settings.max_task_length,
+        description="Optional existing text/code artifact to audit directly without running the Proposer node.",
+    )
     thread_id: Optional[str] = Field(
         default=None,
         description="Optional thread ID for correlating or inspecting checkpointed execution state.",
@@ -95,17 +101,38 @@ def _validate_config_security(config: MASCConfig):
             )
 
 
+def _invoke_workflow_generator(
+    task_description: str,
+    config: MASCConfig,
+    thread_id: str,
+    initial_artifact: Optional[str] = None,
+):
+    """Calls execute_masc_workflow while remaining compatible with 3-arg test monkeypatches."""
+    sig = inspect.signature(execute_masc_workflow)
+    if "initial_artifact" in sig.parameters:
+        return execute_masc_workflow(
+            task_description,
+            config,
+            thread_id,
+            initial_artifact=initial_artifact,
+        )
+    return execute_masc_workflow(task_description, config, thread_id)
+
+
 async def stream_graph_execution(
     task_description: str,
     config: MASCConfig,
     thread_id: str,
     http_request: Optional[Request] = None,
+    initial_artifact: Optional[str] = None,
 ):
     queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
     async def _producer():
         try:
-            async for state_update in execute_masc_workflow(task_description, config, thread_id):
+            async for state_update in _invoke_workflow_generator(
+                task_description, config, thread_id, initial_artifact=initial_artifact
+            ):
                 node_name = list(state_update.keys())[0]
                 node_data = state_update[node_name]
 
@@ -192,11 +219,13 @@ async def execute_workflow(masc_request: MASCRequest, request: Request):
         )
 
     available_personas = {**ADVERSARY_PERSONAS, **load_personas()}
-    invalid_personas = [
-        adv.persona_name
-        for adv in masc_request.config.adversaries
-        if adv.persona_name not in available_personas
-    ]
+    invalid_personas = []
+    for adv in masc_request.config.adversaries:
+        try:
+            resolve_adversary_persona(adv, available_personas)
+        except ValueError:
+            invalid_personas.append(adv.persona_name)
+
     if invalid_personas:
         raise HTTPException(
             status_code=400,
@@ -207,7 +236,13 @@ async def execute_workflow(masc_request: MASCRequest, request: Request):
 
     thread_id = masc_request.thread_id or str(uuid.uuid4())
     return StreamingResponse(
-        stream_graph_execution(masc_request.task_description, masc_request.config, thread_id, request),
+        stream_graph_execution(
+            masc_request.task_description,
+            masc_request.config,
+            thread_id,
+            request,
+            initial_artifact=masc_request.initial_artifact,
+        ),
         media_type="text/event-stream",
     )
 

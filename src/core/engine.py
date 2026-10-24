@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Literal, Optional
 
 from langchain.chat_models import init_chat_model
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.outputs import LLMResult
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -14,7 +16,7 @@ from langgraph.graph.state import CompiledStateGraph
 from psycopg_pool import AsyncConnectionPool
 
 from src.config.settings import settings, validate_base_url
-from src.core.personas import ADVERSARY_PERSONAS, load_personas
+from src.core.personas import ADVERSARY_PERSONAS, load_personas, resolve_adversary_persona
 from src.core.state import (
     Artifact,
     Critique,
@@ -24,6 +26,7 @@ from src.core.state import (
     MASCConfig,
     MASCState,
     PersonaConfig,
+    TokenUsage,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,8 @@ _pg_pool_lock = asyncio.Lock()
 _pg_setup_done: bool = False
 _memory_saver = MemorySaver()
 _memory_thread_order: deque[str] = deque()
+_llm_semaphore: Optional[asyncio.Semaphore] = None
+_llm_semaphore_limit: Optional[int] = None
 
 SEVERITY_RANK = {
     "CRITICAL": 0,
@@ -40,6 +45,59 @@ SEVERITY_RANK = {
     "MEDIUM": 2,
     "LOW": 3,
 }
+
+
+def _get_llm_semaphore(max_concurrent: int) -> asyncio.Semaphore:
+    """Returns a process-wide asyncio.Semaphore for bounding simultaneous LLM calls."""
+    global _llm_semaphore, _llm_semaphore_limit
+    if _llm_semaphore is None or _llm_semaphore_limit != max_concurrent:
+        _llm_semaphore = asyncio.Semaphore(max(1, max_concurrent))
+        _llm_semaphore_limit = max_concurrent
+    return _llm_semaphore
+
+
+class _TokenUsageCallback(AsyncCallbackHandler):
+    """Captures token usage metadata across standard and structured LLM calls."""
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.total_tokens = 0
+
+    async def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        if response.llm_output and isinstance(response.llm_output, dict):
+            token_usage = response.llm_output.get("token_usage") or response.llm_output.get("usage") or {}
+            if isinstance(token_usage, dict):
+                self.input_tokens += int(token_usage.get("prompt_tokens", token_usage.get("input_tokens", 0)) or 0)
+                self.output_tokens += int(
+                    token_usage.get("completion_tokens", token_usage.get("output_tokens", 0)) or 0
+                )
+                self.total_tokens += int(token_usage.get("total_tokens", 0) or 0)
+
+        for gen_list in response.generations:
+            for gen in gen_list:
+                msg = getattr(gen, "message", None)
+                usage_meta = getattr(msg, "usage_metadata", None)
+                if isinstance(usage_meta, dict):
+                    self.input_tokens += int(usage_meta.get("input_tokens", 0) or 0)
+                    self.output_tokens += int(usage_meta.get("output_tokens", 0) or 0)
+                    self.total_tokens += int(usage_meta.get("total_tokens", 0) or 0)
+
+
+def _extract_usage(response: Any, cb: _TokenUsageCallback) -> tuple[int, int, int]:
+    """Extracts (input_tokens, output_tokens, total_tokens) from either callback or AIMessage."""
+    if cb.total_tokens > 0 or cb.input_tokens > 0 or cb.output_tokens > 0:
+        total = cb.total_tokens or (cb.input_tokens + cb.output_tokens)
+        return cb.input_tokens, cb.output_tokens, total
+
+    usage_meta = getattr(response, "usage_metadata", None)
+    if isinstance(usage_meta, dict):
+        inp = int(usage_meta.get("input_tokens", 0) or 0)
+        out = int(usage_meta.get("output_tokens", 0) or 0)
+        tot = int(usage_meta.get("total_tokens", 0) or (inp + out))
+        return inp, out, tot
+
+    return 0, 0, 0
 
 
 def _track_and_prune_memory_threads(thread_id: str):
@@ -194,10 +252,19 @@ class MASCNodes:
             base_url=validated_base_url,
         ).with_retry(**retry_config)
 
+    async def _invoke_chain(self, chain: Any, inputs: dict[str, Any]) -> tuple[Any, tuple[int, int, int]]:
+        """Executes a LangChain runnable under the global concurrency semaphore and records token usage."""
+        sem = _get_llm_semaphore(self.settings.max_concurrent_llm_calls)
+        usage_cb = _TokenUsageCallback()
+        async with sem:
+            response = await chain.ainvoke(inputs, config={"callbacks": [usage_cb]})
+        return response, _extract_usage(response, usage_cb)
+
     async def propose(self, state: MASCState) -> dict:
         logger.info("Entering Proposer Node")
         config = state["config"].proposer
         llm = self._get_llm(config)
+        current_usage = state.get("token_usage") or TokenUsage()
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -212,11 +279,12 @@ class MASCNodes:
         )
 
         chain = prompt | llm
-        response = await chain.ainvoke(
+        response, (inp, out, tot) = await self._invoke_chain(
+            chain,
             {
                 "persona_name": config.persona_name,
                 "task_description": state["task_description"],
-            }
+            },
         )
 
         return {
@@ -226,6 +294,7 @@ class MASCNodes:
                 history=[f"Initial proposal by {config.persona_name} using {config.llm_config.model_name}"],
             ),
             "current_turn": 1,
+            "token_usage": current_usage.add(inp, out, tot, calls=1),
         }
 
     async def adversarial_analysis(self, state: MASCState) -> dict:
@@ -235,25 +304,21 @@ class MASCNodes:
         task_description = state["task_description"]
         adversary_configs = state["config"].adversaries
         personas_registry = {**ADVERSARY_PERSONAS, **load_personas()}
+        current_usage = state.get("token_usage") or TokenUsage()
 
-        unknown_personas = [
-            adv.persona_name for adv in adversary_configs if adv.persona_name not in personas_registry
+        resolved_personas = [
+            resolve_adversary_persona(adv_config, personas_registry) for adv_config in adversary_configs
         ]
-        if unknown_personas:
-            raise ValueError(
-                f"Unknown adversary persona(s): {unknown_personas}. "
-                f"Available personas: {list(personas_registry.keys())}"
-            )
 
         critique_tasks = [
             self._run_single_adversary(
                 adv_config=adv_config,
                 name=adv_config.persona_name,
-                persona=personas_registry[adv_config.persona_name],
+                persona=persona_def,
                 task_description=task_description,
                 content=current_content,
             )
-            for adv_config in adversary_configs
+            for adv_config, persona_def in zip(adversary_configs, resolved_personas)
         ]
 
         results = await asyncio.gather(*critique_tasks, return_exceptions=True)
@@ -261,8 +326,13 @@ class MASCNodes:
         valid_critiques: list[Critique] = []
         errors: list[str] = []
         for res in results:
-            if isinstance(res, Critique):
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], Critique):
+                critique_obj, (inp, out, tot) = res
+                valid_critiques.append(critique_obj)
+                current_usage = current_usage.add(inp, out, tot, calls=1)
+            elif isinstance(res, Critique):
                 valid_critiques.append(res)
+                current_usage = current_usage.add(calls=1)
             elif isinstance(res, Exception):
                 logger.error(f"Adversary task failed with exception: {res}\n{traceback.format_exc()}")
                 errors.append(str(res))
@@ -275,6 +345,7 @@ class MASCNodes:
         return {
             "critiques_collection": CritiquesCollection(critiques=valid_critiques),
             "current_turn": current_turn,
+            "token_usage": current_usage,
         }
 
     async def _run_single_adversary(
@@ -284,7 +355,7 @@ class MASCNodes:
         persona: dict,
         task_description: str,
         content: str,
-    ) -> Critique:
+    ) -> tuple[Critique, tuple[int, int, int]]:
         try:
             llm = self._get_llm(adv_config)
             structured_llm = llm.with_structured_output(CritiqueLLMOutput)
@@ -306,21 +377,23 @@ class MASCNodes:
             chain = prompt | structured_llm
             logger.info(f"Running adversary: {name}")
 
-            result: CritiqueLLMOutput = await chain.ainvoke(
+            result, usage_tuple = await self._invoke_chain(
+                chain,
                 {
                     "system_prompt": persona["system_prompt"],
                     "task_description": task_description,
                     "artifact_content": content,
-                }
+                },
             )
             logger.info(f"Successfully generated critique from {name}")
 
             payload = result.payload if result and result.payload else []
-            return Critique(
+            critique = Critique(
                 source_adversary=name,
                 critique_type=persona["critique_type"],
                 payload=payload,
             )
+            return critique, usage_tuple
         except Exception as e:
             logger.error(f"Adversary '{name}' failed. Error: {e}")
             raise
@@ -359,7 +432,7 @@ class MASCNodes:
                 (SEVERITY_RANK.get(item.severity, 99) for item in c.payload),
                 default=99,
             )
-            return type_rank, highest_severity
+            return (type_rank, highest_severity)
 
         sorted_critiques.sort(key=_critique_sort_key)
         logger.info("Deterministic triage complete. Processing order established.")
@@ -372,8 +445,10 @@ class MASCNodes:
     async def synthesize_sequential(self, state: MASCState) -> dict:
         current_turn = state.get("current_turn", 1)
         logger.info(f"Entering Synthesizer Node (Sequential Refinement - Turn {current_turn})")
-        config = state["config"].synthesizer
+        masc_cfg = state["config"]
+        config = masc_cfg.synthesizer
         llm = self._get_llm(config)
+        current_usage = state.get("token_usage") or TokenUsage()
 
         current_artifact = state["current_artifact"].model_copy(deep=True)
         history_log = current_artifact.history.copy()
@@ -390,58 +465,139 @@ class MASCNodes:
                     history=history_log,
                 ),
                 "current_turn": current_turn + 1,
+                "token_usage": current_usage,
             }
 
         successful_steps = 0
         errors: list[str] = []
         turn_modifications: list[str] = []
 
-        for critique in actionable_critiques:
+        antagonistic_critiques = [c for c in actionable_critiques if c.critique_type == "ANTAGONISTIC"]
+        constructive_critiques = [c for c in actionable_critiques if c.critique_type == "CONSTRUCTIVE"]
+
+        # Stage 1: Process Antagonistic Critiques
+        for critique in antagonistic_critiques:
             prior_context = (
                 "\n".join(f"- {m}" for m in turn_modifications)
                 if turn_modifications
                 else "None yet in this turn."
             )
             try:
-                if critique.critique_type == "ANTAGONISTIC":
-                    logger.info(f"Refuting antagonistic critique from {critique.source_adversary}")
-                    refutation_prompt = ChatPromptTemplate.from_messages(
-                        [
-                            (
-                                "system",
-                                "You are a Master Synthesizer. Your task is to harden a proposal against this cynical, "
-                                "antagonistic argument while remaining strictly faithful to the Original Task Description. "
-                                "Identify the core fallacious principle in the critique and revise the proposal to "
-                                "explicitly defend against it. Add justifications or foundational principles that make "
-                                "the artifact's core thesis more robust. Do not integrate the destructive premise of "
-                                "the antagonistic feedback; build a defense against it. Preserve any fixes already "
-                                "applied earlier in this turn.",
-                            ),
-                            (
-                                "human",
-                                "Original Task Description:\n{task_description}\n\n"
-                                "Fixes Already Applied Earlier in This Turn:\n{prior_context}\n\n"
-                                "Current Proposal:\n{proposal}\n\n"
-                                "Antagonistic Critique:\n{ant_critique}",
-                            ),
-                        ]
-                    )
-                    refutation_chain = refutation_prompt | llm
-                    response = await refutation_chain.ainvoke(
-                        {
-                            "task_description": task_description,
-                            "prior_context": prior_context,
-                            "proposal": current_artifact.content,
-                            "ant_critique": critique.model_dump_json(indent=2),
-                        }
-                    )
-                    current_artifact.content = str(response.content)
-                    entry = f"[Turn {current_turn}] Hardened against: {critique.source_adversary}"
-                    history_log.append(entry)
-                    turn_modifications.append(entry)
-                    successful_steps += 1
+                logger.info(f"Refuting antagonistic critique from {critique.source_adversary}")
+                refutation_prompt = ChatPromptTemplate.from_messages(
+                    [
+                        (
+                            "system",
+                            "You are a Master Synthesizer. Your task is to harden a proposal against this cynical, "
+                            "antagonistic argument while remaining strictly faithful to the Original Task Description. "
+                            "Identify the core fallacious principle in the critique and revise the proposal to "
+                            "explicitly defend against it. Add justifications or foundational principles that make "
+                            "the artifact's core thesis more robust. Do not integrate the destructive premise of "
+                            "the antagonistic feedback; build a defense against it. Preserve any fixes already "
+                            "applied earlier in this turn.",
+                        ),
+                        (
+                            "human",
+                            "Original Task Description:\n{task_description}\n\n"
+                            "Fixes Already Applied Earlier in This Turn:\n{prior_context}\n\n"
+                            "Current Proposal:\n{proposal}\n\n"
+                            "Antagonistic Critique:\n{ant_critique}",
+                        ),
+                    ]
+                )
+                refutation_chain = refutation_prompt | llm
+                response, (inp, out, tot) = await self._invoke_chain(
+                    refutation_chain,
+                    {
+                        "task_description": task_description,
+                        "prior_context": prior_context,
+                        "proposal": current_artifact.content,
+                        "ant_critique": critique.model_dump_json(indent=2),
+                    },
+                )
+                current_usage = current_usage.add(inp, out, tot, calls=1)
+                current_artifact.content = str(response.content)
+                entry = f"[Turn {current_turn}] Hardened against: {critique.source_adversary}"
+                history_log.append(entry)
+                turn_modifications.append(entry)
+                successful_steps += 1
+            except Exception as e:
+                logger.error(f"Failed to process critique from {critique.source_adversary}. Error: {e}")
+                errors.append(f"{critique.source_adversary}: {e}")
+                history_log.append(
+                    f"[Turn {current_turn}] ERROR: Failed to apply fix for critique from {critique.source_adversary}."
+                )
 
-                elif critique.critique_type == "CONSTRUCTIVE":
+        # Stage 2: Process Constructive Critiques (either batched in a single pass or per-adversary)
+        if constructive_critiques and masc_cfg.batch_constructive_critiques:
+            prior_context = (
+                "\n".join(f"- {m}" for m in turn_modifications)
+                if turn_modifications
+                else "None yet in this turn."
+            )
+            all_Constructive_lines: list[str] = []
+            log_entries_to_add: list[str] = []
+            idx_counter = 1
+            for critique in constructive_critiques:
+                normalized_issues = [_normalize_Issue(item) for item in critique.payload]
+                for issue in normalized_issues:
+                    all_Constructive_lines.append(
+                        f"{idx_counter}. [{issue.severity}] (Source: {critique.source_adversary}) "
+                        f"Issue: {issue.description}\n   Recommendation: {issue.recommendation}"
+                    )
+                    log_entries_to_add.append(
+                        f"[Turn {current_turn}] Fixed [{issue.severity}] critique: "
+                        f"'{issue.description}' from {critique.source_adversary}."
+                    )
+                    idx_counter += 1
+
+            try:
+                revision_prompt = ChatPromptTemplate.from_messages(
+                    [
+                        (
+                            "system",
+                            "You are a Master Technical Editor. Your task is to revise the current draft to "
+                            "address all prioritized constructive critiques from the specialist auditors in a single "
+                            "unified pass while remaining strictly aligned with the Original Task Description. "
+                            "Ensure all listed issues are resolved cleanly without degrading unaffected sections "
+                            "or reverting fixes already applied earlier in this turn.",
+                        ),
+                        (
+                            "human",
+                            "Original Task Description:\n{task_description}\n\n"
+                            "Fixes Already Applied Earlier in This Turn:\n{prior_context}\n\n"
+                            "Current Draft:\n{draft}\n\n"
+                            "Prioritized Constructive Critiques:\n{formatted_issues}",
+                        ),
+                    ]
+                )
+                revision_chain = revision_prompt | llm
+                response, (inp, out, tot) = await self._invoke_chain(
+                    revision_chain,
+                    {
+                        "task_description": task_description,
+                        "prior_context": prior_context,
+                        "draft": current_artifact.content,
+                        "formatted_issues": "\n".join(all_Constructive_lines),
+                    },
+                )
+                current_usage = current_usage.add(inp, out, tot, calls=1)
+                current_artifact.content = str(response.content)
+                history_log.extend(log_entries_to_add)
+                turn_modifications.extend(log_entries_to_add)
+                successful_steps += 1
+            except Exception as e:
+                logger.error(f"Failed batched constructive synthesis. Error: {e}")
+                errors.append(f"BatchedConstructive: {e}")
+                history_log.append(f"[Turn {current_turn}] ERROR: Failed to apply batched constructive fixes.")
+        else:
+            for critique in constructive_critiques:
+                prior_context = (
+                    "\n".join(f"- {m}" for m in turn_modifications)
+                    if turn_modifications
+                    else "None yet in this turn."
+                )
+                try:
                     normalized_issues = [_normalize_Issue(item) for item in critique.payload]
                     logger.info(
                         f"Addressing {len(normalized_issues)} constructive issue(s) from {critique.source_adversary}"
@@ -472,15 +628,17 @@ class MASCNodes:
                         ]
                     )
                     revision_chain = revision_prompt | llm
-                    response = await revision_chain.ainvoke(
+                    response, (inp, out, tot) = await self._invoke_chain(
+                        revision_chain,
                         {
                             "task_description": task_description,
                             "prior_context": prior_context,
                             "draft": current_artifact.content,
                             "adversary_name": critique.source_adversary,
                             "formatted_issues": formatted_issues,
-                        }
+                        },
                     )
+                    current_usage = current_usage.add(inp, out, tot, calls=1)
                     current_artifact.content = str(response.content)
                     for issue in normalized_issues:
                         entry = (
@@ -490,13 +648,12 @@ class MASCNodes:
                         history_log.append(entry)
                         turn_modifications.append(entry)
                     successful_steps += 1
-
-            except Exception as e:
-                logger.error(f"Failed to process critique from {critique.source_adversary}. Error: {e}")
-                errors.append(f"{critique.source_adversary}: {e}")
-                history_log.append(
-                    f"[Turn {current_turn}] ERROR: Failed to apply fix for critique from {critique.source_adversary}."
-                )
+                except Exception as e:
+                    logger.error(f"Failed to process critique from {critique.source_adversary}. Error: {e}")
+                    errors.append(f"{critique.source_adversary}: {e}")
+                    history_log.append(
+                        f"[Turn {current_turn}] ERROR: Failed to apply fix for critique from {critique.source_adversary}."
+                    )
 
         if actionable_critiques and successful_steps == 0:
             raise RuntimeError(
@@ -508,13 +665,18 @@ class MASCNodes:
             content=current_artifact.content,
             history=history_log,
         )
-        return {"current_artifact": final_artifact, "current_turn": current_turn + 1}
+        return {
+            "current_artifact": final_artifact,
+            "current_turn": current_turn + 1,
+            "token_usage": current_usage,
+        }
 
     async def synthesize_architect(self, state: MASCState) -> dict:
         current_turn = state.get("current_turn", 1)
         logger.info(f"Entering Synthesizer Node (Architect Protocol - Turn {current_turn})")
         config = state["config"].synthesizer
         llm = self._get_llm(config)
+        current_usage = state.get("token_usage") or TokenUsage()
 
         current_artifact = state["current_artifact"]
         critiques_collection = state.get("critiques_collection") or CritiquesCollection(critiques=[])
@@ -545,13 +707,15 @@ class MASCNodes:
         )
 
         architect_chain = architect_prompt | llm
-        response = await architect_chain.ainvoke(
+        response, (inp, out, tot) = await self._invoke_chain(
+            architect_chain,
             {
                 "task_description": task_description,
                 "proposal": current_artifact.content,
                 "critiques": critiques_collection.model_dump_json(indent=2),
-            }
+            },
         )
+        current_usage = current_usage.add(inp, out, tot, calls=1)
 
         history_log.append(f"[Turn {current_turn}] Architect unified critiques into a hardened artifact.")
         final_artifact = Artifact(
@@ -560,7 +724,20 @@ class MASCNodes:
             history=history_log,
         )
 
-        return {"current_artifact": final_artifact, "current_turn": current_turn + 1}
+        return {
+            "current_artifact": final_artifact,
+            "current_turn": current_turn + 1,
+            "token_usage": current_usage,
+        }
+
+
+def should_propose_or_audit(state: MASCState) -> Literal["propose", "adversarial_analysis"]:
+    """Routes directly to adversarial_analysis when an initial artifact is supplied (Audit-Only mode)."""
+    artifact = state.get("current_artifact")
+    if artifact and artifact.content and artifact.content.strip():
+        logger.info("Initial artifact detected; skipping Proposer and routing directly to Adversarial Analysis.")
+        return "adversarial_analysis"
+    return "propose"
 
 
 def should_route_to_synthesis(state: MASCState) -> Literal["triage_critiques", "synthesize_architect"]:
@@ -572,19 +749,38 @@ def should_route_to_synthesis(state: MASCState) -> Literal["triage_critiques", "
 
 
 def should_continue_loop(state: MASCState) -> Literal["adversarial_analysis", "__end__"]:
-    if state["current_turn"] > state["config"].max_turns:
+    config = state["config"]
+    if state["current_turn"] > config.max_turns:
         logger.info("Max turns reached. Ending workflow.")
         return "__end__"
 
-    # Early convergence: if critiques_collection is populated for this turn, check if any actionable issues existed
-    collection = state.get("critiques_collection")
-    if collection is not None:
-        has_actionable_issues = any(len(c.payload) > 0 for c in collection.critiques)
-        if not has_actionable_issues:
-            logger.info("Early convergence achieved: no actionable critiques remaining. Ending workflow.")
+    # FinOps circuit breaker: check if cumulative token budget has been reached
+    token_usage = state.get("token_usage")
+    if config.max_total_tokens is not None and token_usage is not None:
+        if token_usage.total_tokens >= config.max_total_tokens:
+            logger.warning(
+                f"Token budget reached ({token_usage.total_tokens} >= {config.max_total_tokens}). "
+                "Halting workflow early."
+            )
             return "__end__"
 
-    logger.info(f"Looping back for Turn {state['current_turn']} / {state['config'].max_turns}")
+    # Early convergence: check if any critiques meet or exceed the configured stop_on_max_severity threshold
+    collection = state.get("critiques_collection")
+    if collection is not None and config.stop_on_max_severity != "NONE":
+        threshold_rank = SEVERITY_RANK.get(config.stop_on_max_severity, 3)
+        has_qualifying_issues = any(
+            SEVERITY_RANK.get(item.severity, 99) <= threshold_rank
+            for critique in collection.critiques
+            for item in critique.payload
+        )
+        if not has_qualifying_issues:
+            logger.info(
+                f"Early convergence achieved: no critiques with severity >= {config.stop_on_max_severity}. "
+                "Ending workflow."
+            )
+            return "__end__"
+
+    logger.info(f"Looping back for Turn {state['current_turn']} / {config.max_turns}")
     return "adversarial_analysis"
 
 
@@ -599,7 +795,13 @@ def build_masc_graph(checkpointer=None) -> CompiledStateGraph:
     graph_builder.add_node("synthesize_sequential", nodes.synthesize_sequential)
     graph_builder.add_node("synthesize_architect", nodes.synthesize_architect)
 
-    graph_builder.set_entry_point("propose")
+    graph_builder.set_conditional_entry_point(
+        should_propose_or_audit,
+        {
+            "propose": "propose",
+            "adversarial_analysis": "adversarial_analysis",
+        },
+    )
     graph_builder.add_edge("propose", "adversarial_analysis")
 
     graph_builder.add_conditional_edges(
@@ -627,9 +829,27 @@ def build_masc_graph(checkpointer=None) -> CompiledStateGraph:
     return graph_builder.compile(checkpointer=checkpointer)
 
 
-async def execute_masc_workflow(task: str, config: MASCConfig, thread_id: str) -> AsyncGenerator[dict, None]:
+async def execute_masc_workflow(
+    task: str,
+    config: MASCConfig,
+    thread_id: str,
+    initial_artifact: Optional[str] = None,
+) -> AsyncGenerator[dict, None]:
     """Executes the MASC workflow and streams node state updates."""
-    initial_state = {"task_description": task, "config": config, "current_turn": 1}
+    resolved_initial_text = (initial_artifact or config.initial_artifact or "").strip()
+    initial_state: dict[str, Any] = {
+        "task_description": task,
+        "config": config,
+        "current_turn": 1,
+        "token_usage": TokenUsage(),
+    }
+    if resolved_initial_text:
+        initial_state["current_artifact"] = Artifact(
+            version="1.0_initial",
+            content=resolved_initial_text,
+            history=["User-supplied initial artifact (Audit-Only mode)"],
+        )
+
     run_config: dict = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": settings.max_recursion_depth,

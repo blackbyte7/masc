@@ -11,6 +11,11 @@ class MASCSettings(BaseSettings):
     max_turns_limit: int = Field(default=10, description="Maximum allowed critique-synthesis cycles.")
     max_recursion_depth: int = Field(default=25, description="LangGraph recursion limit to prevent infinite loops.")
     max_task_length: int = Field(default=100000, description="Maximum character length for task descriptions.")
+    max_concurrent_llm_calls: int = Field(
+        default=10,
+        ge=1,
+        description="Global concurrency semaphore limit for simultaneous outbound LLM calls.",
+    )
 
     # LLM Defaults
     default_provider: Literal["OpenAI", "Anthropic", "Google", "Ollama"] = Field(default="OpenAI")

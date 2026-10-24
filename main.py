@@ -5,7 +5,12 @@ import sys
 from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Route logs to stderr so MCP stdio mode never pollutes stdout
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 
 def main():

@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sys
 import uuid
+from typing import Optional
 
 from src.config.settings import settings
 from src.core.engine import close_pg_pool, execute_masc_workflow
@@ -33,7 +34,7 @@ def generate_template(filepath: str):
     print(f"✅ Configuration template generated at: {filepath}")
 
 
-async def run_cli(task: str, config_path: str):
+async def run_cli(task: str, config_path: str, artifact_file: Optional[str] = None):
     print("\n" + "=" * 50)
     print("🧠 MASC Enterprise CLI Execution")
     print("=" * 50)
@@ -45,16 +46,30 @@ async def run_cli(task: str, config_path: str):
         print(f"❌ Failed to parse config file '{config_path}': {e}")
         sys.exit(1)
 
+    initial_artifact: Optional[str] = None
+    if artifact_file:
+        try:
+            with open(artifact_file, "r", encoding="utf-8") as af:
+                initial_artifact = af.read()
+        except Exception as e:
+            print(f"❌ Failed to read initial artifact file '{artifact_file}': {e}")
+            sys.exit(1)
+
     thread_id = str(uuid.uuid4())
     print(f"Task: {task}")
     print(f"Thread ID: {thread_id}")
     print(f"Synthesis Protocol: {config.synthesis_protocol}")
     print(f"Max Cycles: {config.max_turns}")
+    if initial_artifact or config.initial_artifact:
+        print("Mode: Audit-Only (Skipping Proposer)")
     print("-" * 50)
 
     try:
         final_content = ""
-        async for state in execute_masc_workflow(task, config, thread_id):
+        final_usage = None
+        async for state in execute_masc_workflow(
+            task, config, thread_id, initial_artifact=initial_artifact
+        ):
             step_name = list(state.keys())[0]
             node_state = state[step_name]
 
@@ -69,11 +84,18 @@ async def run_cli(task: str, config_path: str):
 
             if step_name in ("synthesize_sequential", "synthesize_architect"):
                 final_content = node_state["current_artifact"].content
+            if "token_usage" in node_state:
+                final_usage = node_state["token_usage"]
 
         print("\n" + "=" * 50)
         print("🎯 FINAL SYNTHESIS ARTIFACT")
         print("=" * 50)
         print(final_content)
+        if final_usage:
+            print(
+                f"\n📊 Token Usage: {final_usage.total_tokens} total "
+                f"({final_usage.input_tokens} in / {final_usage.output_tokens} out across {final_usage.llm_calls} LLM calls)"
+            )
         print("\n✅ Workflow Completed Successfully.")
 
     except Exception as e:
@@ -87,6 +109,12 @@ def main():
     parser = argparse.ArgumentParser(description="MASC General-Purpose Dialectical AI")
     parser.add_argument("--task", type=str, help="The prompt or goal for the MASC workflow.")
     parser.add_argument("--config", type=str, help="Path to the JSON configuration file.")
+    parser.add_argument(
+        "--initial-artifact",
+        type=str,
+        metavar="ARTIFACT_FILEPATH",
+        help="Optional path to an existing file to audit directly (skips Proposer).",
+    )
     parser.add_argument(
         "--generate-template",
         type=str,
@@ -105,7 +133,7 @@ def main():
         print("\nError: Both --task and --config are required to run an execution.")
         sys.exit(1)
 
-    asyncio.run(run_cli(args.task, args.config))
+    asyncio.run(run_cli(args.task, args.config, artifact_file=args.initial_artifact))
 
 
 if __name__ == "__main__":

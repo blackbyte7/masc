@@ -1,6 +1,8 @@
 import json
+import pytest
 
-from src.core.personas import load_personas
+from src.core.personas import load_personas, resolve_adversary_persona
+from src.core.state import LLMConfig, PersonaConfig
 
 
 def test_default_personas_loaded():
@@ -41,3 +43,23 @@ def test_custom_personas_loading_and_validation(tmp_path, monkeypatch):
     assert "InvalidCritiqueTypePersona" not in personas
     assert "EmptyPromptPersona" not in personas
     assert "DA" in personas
+
+
+def test_inline_persona_resolution():
+    llm_cfg = LLMConfig(provider="OpenAI", model_name="gpt-5.2-pro")
+    inline_cfg = PersonaConfig(
+        persona_name="InlineK8sAuditor",
+        llm_config=llm_cfg,
+        critique_type="CONSTRUCTIVE",
+        system_prompt="Audit Kubernetes manifests for pod security standards.",
+    )
+    resolved = resolve_adversary_persona(inline_cfg)
+    assert resolved["critique_type"] == "CONSTRUCTIVE"
+    assert "Kubernetes" in resolved["system_prompt"]
+
+    with pytest.raises(ValueError, match="both 'critique_type' and a non-empty 'system_prompt'"):
+        PersonaConfig(
+            persona_name="IncompleteInline",
+            llm_config=llm_cfg,
+            critique_type="CONSTRUCTIVE",
+        )

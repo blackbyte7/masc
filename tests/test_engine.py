@@ -5,7 +5,12 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.runnables import RunnableLambda
 
 from src.config.settings import settings
-from src.core.engine import MASCNodes, should_continue_loop, should_route_to_synthesis
+from src.core.engine import (
+    MASCNodes,
+    should_continue_loop,
+    should_propose_or_audit,
+    should_route_to_synthesis,
+)
 from src.core.state import (
     Artifact,
     Critique,
@@ -13,7 +18,27 @@ from src.core.state import (
     CritiqueLLMOutput,
     CritiquesCollection,
     MASCState,
+    TokenUsage,
 )
+
+
+@pytest.mark.asyncio
+async def test_should_propose_or_audit_routing(base_masc_config):
+    state_empty: MASCState = {
+        "task_description": "Test",
+        "config": base_masc_config,
+        "current_artifact": Artifact(version="0.0", content=""),
+        "current_turn": 1,
+    }
+    assert should_propose_or_audit(state_empty) == "propose"
+
+    state_with_artifact: MASCState = {
+        "task_description": "Audit existing code",
+        "config": base_masc_config,
+        "current_artifact": Artifact(version="1.0_initial", content="def foo(): pass"),
+        "current_turn": 1,
+    }
+    assert should_propose_or_audit(state_with_artifact) == "adversarial_analysis"
 
 
 @pytest.mark.asyncio
@@ -69,6 +94,46 @@ async def test_early_convergence_when_no_actionable_critiques(base_masc_config):
         "critiques_collection": CritiquesCollection(critiques=[]),
     }
     # Even though current_turn (2) <= max_turns (5), empty critiques trigger early convergence
+    assert should_continue_loop(state) == "__end__"
+
+
+@pytest.mark.asyncio
+async def test_severity_threshold_convergence_and_token_budget_breaker(base_masc_config):
+    base_masc_config.max_turns = 5
+    base_masc_config.stop_on_max_severity = "HIGH"
+
+    low_only_critiques = CritiquesCollection(
+        critiques=[
+            Critique(
+                source_adversary="CodeAuditor",
+                critique_type="CONSTRUCTIVE",
+                payload=[CritiqueItem(severity="LOW", description="Nitpick", recommendation="Optional")],
+            )
+        ]
+    )
+    state: MASCState = {
+        "task_description": "Test",
+        "config": base_masc_config,
+        "current_artifact": Artifact(version="2.0", content="hardened"),
+        "current_turn": 2,
+        "critiques_collection": low_only_critiques,
+    }
+    # Stops early because only LOW severity remains while threshold is HIGH
+    assert should_continue_loop(state) == "__end__"
+
+    # Now test token budget circuit breaker when HIGH severity exists
+    high_critiques = CritiquesCollection(
+        critiques=[
+            Critique(
+                source_adversary="CodeAuditor",
+                critique_type="CONSTRUCTIVE",
+                payload=[CritiqueItem(severity="HIGH", description="Major bug", recommendation="Fix")],
+            )
+        ]
+    )
+    base_masc_config.max_total_tokens = 1000
+    state["critiques_collection"] = high_critiques
+    state["token_usage"] = TokenUsage(input_tokens=600, output_tokens=500, total_tokens=1100, llm_calls=3)
     assert should_continue_loop(state) == "__end__"
 
 
@@ -161,6 +226,7 @@ async def test_propose_node(base_masc_config, monkeypatch):
     assert result["current_artifact"].version == "1.0_proposal"
     assert result["current_artifact"].content == "Initial drafted proposal content."
     assert len(result["current_artifact"].history) == 1
+    assert result["token_usage"].llm_calls == 1
 
 
 @pytest.mark.asyncio
@@ -195,6 +261,7 @@ async def test_adversarial_analysis_node(base_masc_config, monkeypatch):
     assert collection.critiques[0].source_adversary == "DA"
     assert collection.critiques[0].critique_type == "ANTAGONISTIC"
     assert collection.critiques[0].payload[0].severity == "HIGH"
+    assert result["token_usage"].llm_calls == 1
 
 
 @pytest.mark.asyncio
@@ -219,7 +286,7 @@ async def test_adversarial_analysis_handles_curly_braces_in_system_prompt(base_m
         "critique_type": "CONSTRUCTIVE",
         "system_prompt": 'Audit this JSON structure: {"user_id": 123, "role": "admin"}',
     }
-    critique = await nodes._run_single_adversary(
+    critique, _usage = await nodes._run_single_adversary(
         adv_config=base_masc_config.adversaries[0],
         name="CustomJSONAuditor",
         persona=persona_with_braces,
@@ -301,6 +368,7 @@ async def test_synthesize_sequential_batches_per_adversary(base_masc_config, mon
     assert artifact.version == "2.0_sequential"
     assert artifact.content == "Draft after fixing all CodeAuditor issues in a single batched pass."
     assert len(artifact.history) == 4
+    assert result["token_usage"].llm_calls == 2
 
 
 @pytest.mark.asyncio
@@ -374,3 +442,4 @@ async def test_synthesize_architect_node(base_masc_config, monkeypatch):
     assert artifact.version == "2.0_architect"
     assert artifact.content == "Holistically rewritten architect proposal."
     assert len(artifact.history) == 3
+    assert result["token_usage"].llm_calls == 1

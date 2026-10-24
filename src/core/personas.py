@@ -1,6 +1,9 @@
 import json
 import logging
 import os
+from typing import Optional
+
+from src.core.state import PersonaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,27 @@ def load_personas() -> dict:
             logger.error(f"Failed to load custom personas from {custom_file_path}: {e}")
 
     return personas
+
+
+def resolve_adversary_persona(adv_config: PersonaConfig, registry: Optional[dict] = None) -> dict:
+    """
+    Resolves an adversary's persona definition either from inline fields on PersonaConfig
+    or from the global/custom persona registry.
+    """
+    if adv_config.critique_type and adv_config.system_prompt and adv_config.system_prompt.strip():
+        return {
+            "critique_type": adv_config.critique_type,
+            "system_prompt": adv_config.system_prompt.strip(),
+        }
+
+    personas_map = registry if registry is not None else {**ADVERSARY_PERSONAS, **load_personas()}
+    if adv_config.persona_name in personas_map:
+        return personas_map[adv_config.persona_name]
+
+    raise ValueError(
+        f"Unknown adversary persona '{adv_config.persona_name}'. Either select a registered persona "
+        f"({list(personas_map.keys())}) or provide inline 'critique_type' and 'system_prompt'."
+    )
 
 
 # Populated at startup and refreshed dynamically via load_personas()
