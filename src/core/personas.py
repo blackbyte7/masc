@@ -1,7 +1,9 @@
+import ast
 import json
 import logging
 import os
-from typing import Optional
+import re
+from typing import List, Optional
 
 from src.core.state import PersonaConfig
 
@@ -65,6 +67,74 @@ DEFAULT_ADVERSARY_PERSONAS = {
         ),
     },
 }
+
+_CODE_BLOCK_RE = re.compile(r"```(?P<lang>[a-zA-Z0-9_+-]*)\n(?P<code>.*?)```", re.DOTALL)
+_SECRET_PATTERNS = [
+    ("OpenAI API Key pattern", re.compile(r"sk-[a-zA-Z0-9]{20,}")),
+    ("AWS Access Key ID pattern", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("PEM Private Key header", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
+]
+_DANGEROUS_CALLS = {"eval", "exec"}
+
+
+def run_deterministic_verification(persona_name: str, content: str) -> List[str]:
+    """
+    Runs lightweight, deterministic static checks on the artifact to ground adversary critiques
+    with concrete verification findings (AST syntax, dangerous calls, secret patterns, JSON validity).
+    """
+    findings: List[str] = []
+    if not content or not content.strip():
+        return findings
+
+    # 1. Check for hardcoded secret patterns
+    for label, pattern in _SECRET_PATTERNS:
+        if pattern.search(content):
+            findings.append(f"[STATIC SECRET SCAN] Detected potential hardcoded credential matching {label}.")
+
+    # 2. Extract fenced code blocks for Python AST & JSON verification
+    blocks = list(_CODE_BLOCK_RE.finditer(content))
+    for idx, match in enumerate(blocks, start=1):
+        lang = (match.group("lang") or "").strip().lower()
+        code = match.group("code")
+
+        if lang in ("python", "py"):
+            try:
+                tree = ast.parse(code)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call):
+                        func_name = getattr(node.func, "id", None)
+                        attr_name = getattr(node.func, "attr", None)
+                        if func_name in _DANGEROUS_CALLS:
+                            findings.append(
+                                f"[AST AUDIT] Python block #{idx} invokes dangerous builtin '{func_name}()' "
+                                f"at line {getattr(node, 'lineno', '?')}."
+                            )
+                        if attr_name in ("loads", "load") and getattr(getattr(node.func, "value", None), "id", "") in (
+                            "pickle",
+                            "yaml",
+                        ):
+                            findings.append(
+                                f"[AST AUDIT] Python block #{idx} uses potentially unsafe deserialization "
+                                f"at line {getattr(node, 'lineno', '?')}."
+                            )
+                        for kw in node.keywords:
+                            if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                                findings.append(
+                                    f"[AST AUDIT] Python block #{idx} enables 'shell=True' command execution "
+                                    f"at line {getattr(node, 'lineno', '?')}."
+                                )
+            except SyntaxError as exc:
+                findings.append(
+                    f"[AST SYNTAX ERROR] Python code block #{idx} failed to parse: {exc.msg} (line {exc.lineno})."
+                )
+
+        elif lang == "json":
+            try:
+                json.loads(code)
+            except json.JSONDecodeError as exc:
+                findings.append(f"[JSON SYNTAX ERROR] JSON block #{idx} is invalid: {exc.msg} (line {exc.lineno}).")
+
+    return findings
 
 
 def load_personas() -> dict:

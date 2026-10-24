@@ -65,10 +65,12 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
         max_turns_input = int(config_inputs[13])
         stop_severity_input = config_inputs[14]
         batch_constructive_input = bool(config_inputs[15])
+        auto_select_adversaries_input = bool(config_inputs[16])
+        enable_verification_input = bool(config_inputs[17])
 
-        # 3. Unpack Adversaries dynamically (Chunks of 7 starting at index 16)
+        # 3. Unpack Adversaries dynamically (Chunks of 7 starting at index 18)
         adversary_cfgs = []
-        adv_inputs = config_inputs[16:]
+        adv_inputs = config_inputs[18:]
 
         for i in range(settings.max_adversaries):
             chunk = adv_inputs[i * 7 : (i + 1) * 7]
@@ -84,17 +86,19 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
                 )
                 adversary_cfgs.append(PersonaConfig(persona_name=chunk[0], llm_config=adv_llm_cfg))
 
-        if not adversary_cfgs:
-            raise gr.Error("At least one Adversary must be configured.")
+        if not adversary_cfgs and not auto_select_adversaries_input:
+            raise gr.Error("At least one Adversary must be configured (or enable Auto-Select Adversaries).")
 
         masc_config = MASCConfig(
             proposer=proposer_cfg,
             synthesizer=synthesizer_cfg,
             adversaries=adversary_cfgs,
+            auto_select_adversaries=auto_select_adversaries_input,
             synthesis_protocol=synthesis_protocol_input,
             max_turns=max_turns_input,
             stop_on_max_severity=stop_severity_input,
             batch_constructive_critiques=batch_constructive_input,
+            enable_verification_tools=enable_verification_input,
             initial_artifact=cleaned_initial_artifact,
         )
 
@@ -132,6 +136,13 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
                 history = state["propose"]["current_artifact"].history
                 history_md = "\n".join([f"- {entry}" for entry in history])
 
+                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
+
+            if "route_personas" in state:
+                routed_cfg = state["route_personas"].get("config")
+                if routed_cfg:
+                    routed_names = [a.persona_name for a in routed_cfg.adversaries]
+                    critiques_dict = {"auto_selected_adversaries": routed_names}
                 yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
 
             if "adversarial_analysis" in state:
@@ -325,6 +336,20 @@ with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
                         info="Applies all constructive fixes in a single pass per turn to reduce latency and token usage.",
                     )
                     all_ui_inputs.append(batch_constructive_checkbox)
+
+                    auto_select_adversaries_checkbox = gr.Checkbox(
+                        label="Auto-Select Adversaries (Optional Router)",
+                        value=False,
+                        info="Automatically selects relevant adversary personas based on the task description.",
+                    )
+                    all_ui_inputs.append(auto_select_adversaries_checkbox)
+
+                    enable_verification_checkbox = gr.Checkbox(
+                        label="Enable Deterministic Static Verification Tools (Optional)",
+                        value=False,
+                        info="Runs AST syntax, dangerous call, and secret checks to ground adversary critiques.",
+                    )
+                    all_ui_inputs.append(enable_verification_checkbox)
 
                 with gr.TabItem("Adversaries"):
                     for i in range(settings.max_adversaries):

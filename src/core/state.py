@@ -1,4 +1,4 @@
-from typing import Annotated, Any, List, Literal, Optional, TypedDict
+from typing import Any, List, Literal, Optional, TypedDict
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -46,7 +46,17 @@ class PersonaConfig(BaseModel):
 class MASCConfig(BaseModel):
     proposer: PersonaConfig
     synthesizer: PersonaConfig
-    adversaries: Annotated[List[PersonaConfig], Field(min_length=1)]
+    adversaries: List[PersonaConfig] = Field(
+        default_factory=list,
+        description="Configured adversary personas. Must contain at least 1 adversary unless auto_select_adversaries is True.",
+    )
+    auto_select_adversaries: bool = Field(
+        default=False,
+        description=(
+            "Optional feature: if True, dynamically routes and selects the most relevant adversary personas "
+            "from the persona registry based on the task description."
+        ),
+    )
     synthesis_protocol: Literal["Sequential Refinement", "Architect"] = "Sequential Refinement"
     max_turns: int = Field(
         default=1,
@@ -69,6 +79,24 @@ class MASCConfig(BaseModel):
             "unified synthesis pass after refuting antagonistic critiques."
         ),
     )
+    enable_verification_tools: bool = Field(
+        default=False,
+        description=(
+            "Optional feature: if True, runs deterministic static verification checks (AST syntax, secret scanning, "
+            "dangerous function checks) and injects findings into adversary prompts."
+        ),
+    )
+    require_human_approval: bool = Field(
+        default=False,
+        description=(
+            "Optional feature: if True, pauses graph execution before synthesis so a human reviewer can inspect, "
+            "approve, or edit the critiques via the resume endpoint."
+        ),
+    )
+    response_schema: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Optional JSON Schema to enforce structured JSON output on the final synthesized artifact.",
+    )
     max_total_tokens: Optional[int] = Field(
         default=None,
         ge=100,
@@ -78,6 +106,14 @@ class MASCConfig(BaseModel):
         default=None,
         description="Optional pre-existing artifact to audit directly, skipping the initial Proposer node.",
     )
+
+    @model_validator(mode="after")
+    def validate_adversaries_or_auto_router(self) -> "MASCConfig":
+        if not self.adversaries and not self.auto_select_adversaries:
+            raise ValueError(
+                "At least one adversary must be provided in 'adversaries' when 'auto_select_adversaries' is False."
+            )
+        return self
 
     def redacted_dump(self) -> dict[str, Any]:
         """Returns a dictionary representation with all LLM API keys redacted."""
@@ -90,6 +126,19 @@ class MASCConfig(BaseModel):
             if "llm_config" in adv:
                 adv["llm_config"].pop("api_key", None)
         return data
+
+
+class PersonaRouterOutput(BaseModel):
+    """Schema used by the optional Auto-Persona Router node to select relevant critics."""
+
+    selected_personas: List[str] = Field(
+        default_factory=list,
+        description="List of 1 to 3 adversary persona names best suited to audit the given task.",
+    )
+    reasoning: str = Field(
+        default="",
+        description="Brief justification for why these personas were selected.",
+    )
 
 
 class Artifact(BaseModel):

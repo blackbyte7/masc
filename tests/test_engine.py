@@ -7,10 +7,14 @@ from langchain_core.runnables import RunnableLambda
 from src.config.settings import settings
 from src.core.engine import (
     MASCNodes,
+    execute_masc_workflow,
+    resume_masc_workflow,
     should_continue_loop,
     should_propose_or_audit,
+    should_route_after_propose,
     should_route_to_synthesis,
 )
+from src.core.personas import run_deterministic_verification
 from src.core.state import (
     Artifact,
     Critique,
@@ -18,6 +22,7 @@ from src.core.state import (
     CritiqueLLMOutput,
     CritiquesCollection,
     MASCState,
+    PersonaRouterOutput,
     TokenUsage,
 )
 
@@ -31,6 +36,7 @@ async def test_should_propose_or_audit_routing(base_masc_config):
         "current_turn": 1,
     }
     assert should_propose_or_audit(state_empty) == "propose"
+    assert should_route_after_propose(state_empty) == "adversarial_analysis"
 
     state_with_artifact: MASCState = {
         "task_description": "Audit existing code",
@@ -39,6 +45,54 @@ async def test_should_propose_or_audit_routing(base_masc_config):
         "current_turn": 1,
     }
     assert should_propose_or_audit(state_with_artifact) == "adversarial_analysis"
+
+    # When optional auto_select_adversaries is True, route via route_personas first
+    base_masc_config.auto_select_adversaries = True
+    assert should_propose_or_audit(state_with_artifact) == "route_personas"
+    assert should_route_after_propose(state_empty) == "route_personas"
+
+
+@pytest.mark.asyncio
+async def test_optional_route_personas_node(base_masc_config, monkeypatch):
+    nodes = MASCNodes(settings)
+    router_output = PersonaRouterOutput(
+        selected_personas=["SecurityHawk", "CodeAuditor"],
+        reasoning="Task involves code and security.",
+    )
+    mock_llm = MagicMock()
+    mock_llm.with_structured_output.return_value = RunnableLambda(lambda _x: router_output)
+    monkeypatch.setattr(nodes, "_get_llm", lambda _cfg: mock_llm)
+
+    base_masc_config.adversaries = []
+    base_masc_config.auto_select_adversaries = True
+
+    state: MASCState = {
+        "task_description": "Audit this authentication microservice.",
+        "config": base_masc_config,
+        "current_artifact": Artifact(version="1.0", content="code"),
+        "current_turn": 1,
+    }
+
+    result = await nodes.route_personas(state)
+    selected = [adv.persona_name for adv in result["config"].adversaries]
+    assert selected == ["SecurityHawk", "CodeAuditor"]
+    assert result["token_usage"].llm_calls == 1
+
+
+def test_deterministic_verification_helper():
+    bad_code_markdown = (
+        "Here is the implementation:\n"
+        "```python\n"
+        "import subprocess\n"
+        "API_KEY = 'sk-1234567890abcdefghijklmnop'\n"
+        "eval(user_input)\n"
+        "subprocess.run('ls', shell=True)\n"
+        "```\n"
+    )
+    findings = run_deterministic_verification("CodeAuditor", bad_code_markdown)
+    assert any("STATIC SECRET SCAN" in f for f in findings)
+    assert any("eval()" in f for f in findings)
+    assert any("shell=True" in f for f in findings)
 
 
 @pytest.mark.asyncio
@@ -443,3 +497,49 @@ async def test_synthesize_architect_node(base_masc_config, monkeypatch):
     assert artifact.content == "Holistically rewritten architect proposal."
     assert len(artifact.history) == 3
     assert result["token_usage"].llm_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_human_in_the_loop_interrupt_and_resume(base_masc_config, monkeypatch):
+    base_masc_config.require_human_approval = True
+    expected_critique = CritiqueLLMOutput(
+        payload=[
+            CritiqueItem(
+                severity="HIGH",
+                description="Needs human review before patching.",
+                recommendation="Refute this ideological challenge.",
+            )
+        ]
+    )
+
+    def fake_get_llm(self, _cfg):
+        mock = MagicMock()
+        mock.with_structured_output.return_value = RunnableLambda(lambda _x: expected_critique)
+        mock.__or__ = lambda _s, _o: RunnableLambda(lambda _x: MagicMock(content="Synthesized after approval"))
+        return mock
+
+    monkeypatch.setattr(MASCNodes, "_get_llm", fake_get_llm)
+
+    # Allow ChatPromptTemplate | mock_llm to return a fake AIMessage
+    fake_chat = FakeListChatModel(responses=["Synthesized after human approval"])
+    fake_chat.with_structured_output = lambda _schema: RunnableLambda(lambda _x: expected_critique)
+    monkeypatch.setattr(MASCNodes, "_get_llm", lambda _self, _cfg: fake_chat)
+
+    thread_id = "test-hitl-thread-1"
+    events = []
+    async for ev in execute_masc_workflow(
+        "Audit this document",
+        base_masc_config,
+        thread_id,
+        initial_artifact="Initial draft",
+    ):
+        events.append(ev)
+
+    assert "__interrupt__" in events[-1]
+    assert events[-1]["__interrupt__"]["awaiting_human_approval"] is True
+
+    resumed_events = []
+    async for ev in resume_masc_workflow(thread_id=thread_id, approve=True):
+        resumed_events.append(ev)
+
+    assert any("synthesize_sequential" in ev for ev in resumed_events)

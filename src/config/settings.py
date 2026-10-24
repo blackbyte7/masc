@@ -16,6 +16,11 @@ class MASCSettings(BaseSettings):
         ge=1,
         description="Global concurrency semaphore limit for simultaneous outbound LLM calls.",
     )
+    rate_limit_per_minute: int = Field(
+        default=60,
+        ge=0,
+        description="Maximum execution requests per minute per client IP (set to 0 to disable rate limiting).",
+    )
 
     # LLM Defaults
     default_provider: Literal["OpenAI", "Anthropic", "Google", "Ollama"] = Field(default="OpenAI")

@@ -2,7 +2,7 @@ import pytest
 
 from src.core.state import Artifact, MASCConfig
 from src.entrypoints.cli import generate_template
-from src.entrypoints.mcp_server import trigger_masc_audit
+from src.entrypoints.mcp_server import resume_masc_audit, trigger_masc_audit
 from src.utils.model_fetcher import FALLBACK_MODELS, fetch_available_models
 
 
@@ -42,6 +42,27 @@ async def test_mcp_trigger_masc_audit_success(base_masc_config, monkeypatch):
     assert "MASC Dialectical Audit Complete" in result
     assert "Hardened MCP output" in result
     assert "[Turn 1] Fixed issue" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_resume_masc_audit_success(monkeypatch):
+    async def fake_resume(thread_id, critiques_override=None, approve=True):
+        yield {
+            "synthesize_sequential": {
+                "current_artifact": Artifact(
+                    version="2.0_sequential",
+                    content="Resumed MCP output",
+                    history=["[Turn 1] Resumed after human review"],
+                ),
+                "current_turn": 2,
+            }
+        }
+
+    monkeypatch.setattr("src.entrypoints.mcp_server.resume_masc_workflow", fake_resume)
+
+    result = await resume_masc_audit(thread_id="thread-123", approve=True)
+    assert "MASC Resumed Audit Complete" in result
+    assert "Resumed MCP output" in result
 
 
 @pytest.mark.asyncio

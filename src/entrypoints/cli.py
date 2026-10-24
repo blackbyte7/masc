@@ -34,7 +34,13 @@ def generate_template(filepath: str):
     print(f"✅ Configuration template generated at: {filepath}")
 
 
-async def run_cli(task: str, config_path: str, artifact_file: Optional[str] = None):
+async def run_cli(
+    task: str,
+    config_path: str,
+    artifact_file: Optional[str] = None,
+    auto_personas: bool = False,
+    verify_tools: bool = False,
+):
     print("\n" + "=" * 50)
     print("🧠 MASC Enterprise CLI Execution")
     print("=" * 50)
@@ -45,6 +51,11 @@ async def run_cli(task: str, config_path: str, artifact_file: Optional[str] = No
     except Exception as e:
         print(f"❌ Failed to parse config file '{config_path}': {e}")
         sys.exit(1)
+
+    if auto_personas:
+        config.auto_select_adversaries = True
+    if verify_tools:
+        config.enable_verification_tools = True
 
     initial_artifact: Optional[str] = None
     if artifact_file:
@@ -60,6 +71,8 @@ async def run_cli(task: str, config_path: str, artifact_file: Optional[str] = No
     print(f"Thread ID: {thread_id}")
     print(f"Synthesis Protocol: {config.synthesis_protocol}")
     print(f"Max Cycles: {config.max_turns}")
+    if config.auto_select_adversaries:
+        print("Auto-Persona Router: Enabled")
     if initial_artifact or config.initial_artifact:
         print("Mode: Audit-Only (Skipping Proposer)")
     print("-" * 50)
@@ -116,6 +129,16 @@ def main():
         help="Optional path to an existing file to audit directly (skips Proposer).",
     )
     parser.add_argument(
+        "--auto-personas",
+        action="store_true",
+        help="Optional: enable the Auto-Persona Router to dynamically select relevant critics.",
+    )
+    parser.add_argument(
+        "--verify-tools",
+        action="store_true",
+        help="Optional: enable deterministic static verification checks before adversary critique.",
+    )
+    parser.add_argument(
         "--generate-template",
         type=str,
         metavar="FILEPATH",
@@ -133,7 +156,15 @@ def main():
         print("\nError: Both --task and --config are required to run an execution.")
         sys.exit(1)
 
-    asyncio.run(run_cli(args.task, args.config, artifact_file=args.initial_artifact))
+    asyncio.run(
+        run_cli(
+            args.task,
+            args.config,
+            artifact_file=args.initial_artifact,
+            auto_personas=args.auto_personas,
+            verify_tools=args.verify_tools,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 import sys
 import uuid
@@ -7,9 +8,9 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from src.config.settings import settings, validate_base_url
-from src.core.engine import close_pg_pool, execute_masc_workflow
+from src.core.engine import close_pg_pool, execute_masc_workflow, resume_masc_workflow
 from src.core.personas import ADVERSARY_PERSONAS, load_personas, resolve_adversary_persona
-from src.core.state import MASCConfig
+from src.core.state import CritiquesCollection, MASCConfig
 
 # Strictly log to stderr so MCP stdio JSON-RPC messages on stdout are never corrupted
 logging.basicConfig(
@@ -79,6 +80,17 @@ async def trigger_masc_audit(
             return "Error: Workflow failed to produce any output."
 
         last_node_name = list(final_state.keys())[0]
+        if last_node_name == "__interrupt__":
+            interrupt_data = final_state["__interrupt__"]
+            critiques_obj = interrupt_data.get("critiques_collection")
+            critiques_str = (
+                critiques_obj.model_dump_json(indent=2) if hasattr(critiques_obj, "model_dump_json") else "{}"
+            )
+            return (
+                f"MASC Audit Paused for Human Approval (thread_id: {thread_id}).\n\n"
+                f"### Pending Critiques:\n{critiques_str}"
+            )
+
         final_artifact = final_state[last_node_name].get("current_artifact")
 
         if not final_artifact:
@@ -94,6 +106,57 @@ async def trigger_masc_audit(
 
     except Exception as e:
         return f"MASC Execution Error: {str(e)}"
+    finally:
+        await close_pg_pool()
+
+
+@mcp.tool()
+async def resume_masc_audit(
+    thread_id: str,
+    approve: bool = True,
+    critiques_override_json: Optional[str] = None,
+) -> str:
+    """
+    Resumes a paused Human-in-the-Loop MASC workflow by thread_id.
+
+    Args:
+        thread_id: The thread ID of the paused MASC execution.
+        approve: Whether to approve and proceed with synthesis (False aborts the run).
+        critiques_override_json: Optional JSON string of CritiquesCollection to replace pending critiques.
+    """
+    try:
+        override = (
+            CritiquesCollection.model_validate_json(critiques_override_json)
+            if critiques_override_json
+            else None
+        )
+        final_state = None
+        async for state in resume_masc_workflow(
+            thread_id=thread_id,
+            critiques_override=override,
+            approve=approve,
+        ):
+            final_state = state
+
+        if not final_state:
+            return "Error: Resumed workflow produced no output."
+
+        last_node_name = list(final_state.keys())[0]
+        if last_node_name == "aborted":
+            return f"MASC Workflow on thread '{thread_id}' was aborted by reviewer."
+
+        final_artifact = final_state[last_node_name].get("current_artifact")
+        if not final_artifact:
+            return f"MASC Workflow resumed on '{thread_id}', state: {json.dumps(final_state, default=str)}"
+
+        history_formatted = "\n".join([f"- {h}" for h in final_artifact.history])
+        return (
+            f"MASC Resumed Audit Complete (thread_id: {thread_id}).\n\n"
+            f"### Refinement History:\n{history_formatted}\n\n"
+            f"### Final Hardened Output:\n\n{final_artifact.content}"
+        )
+    except Exception as e:
+        return f"MASC Resume Error: {str(e)}"
     finally:
         await close_pg_pool()
 

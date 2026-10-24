@@ -3,7 +3,15 @@ import json
 import pytest
 
 from src.config.settings import settings
-from src.core.state import Artifact
+from src.core.state import Artifact, TokenUsage
+from src.entrypoints.api_server import _rate_limit_buckets
+
+
+@pytest.fixture(autouse=True)
+def clear_rate_limit_buckets():
+    _rate_limit_buckets.clear()
+    yield
+    _rate_limit_buckets.clear()
 
 
 def test_health_endpoint(test_client):
@@ -81,6 +89,35 @@ def test_execute_masc_accepts_inline_custom_persona(test_client, base_masc_confi
     response = test_client.post("/v1/masc/execute", json=payload)
     assert response.status_code == 200
     assert "Audited by inline persona" in response.text
+
+
+def test_execute_masc_accepts_empty_adversaries_when_auto_router_enabled(
+    test_client, base_masc_config, monkeypatch
+):
+    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+        yield {
+            "synthesize_sequential": {
+                "current_artifact": Artifact(
+                    version="2.0_sequential",
+                    content="Auto-routed output",
+                    history=["[Turn 1] Auto-routed"],
+                ),
+                "current_turn": 2,
+            }
+        }
+
+    monkeypatch.setattr("src.entrypoints.api_server.execute_masc_workflow", fake_workflow)
+
+    base_masc_config.adversaries = []
+    base_masc_config.auto_select_adversaries = True
+
+    payload = {
+        "task_description": "Audit this service with auto-selected personas",
+        "config": base_masc_config.model_dump(),
+    }
+    response = test_client.post("/v1/masc/execute", json=payload)
+    assert response.status_code == 200
+    assert "Auto-routed output" in response.text
 
 
 def test_execute_masc_ssrf_base_url_rejected(test_client, base_masc_config):
@@ -186,3 +223,60 @@ def test_execute_masc_sse_stream_and_redaction(test_client, base_masc_config, mo
 def test_get_thread_state_not_found(test_client):
     response = test_client.get("/v1/masc/threads/non-existent-thread-id")
     assert response.status_code == 404
+
+
+def test_openai_models_and_chat_completions_endpoints(test_client, monkeypatch):
+    models_resp = test_client.get("/v1/models")
+    assert models_resp.status_code == 200
+    model_ids = [m["id"] for m in models_resp.json()["data"]]
+    assert "masc-sequential-default" in model_ids
+    assert "masc-auto" in model_ids
+
+    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+        yield {
+            "synthesize_sequential": {
+                "current_artifact": Artifact(
+                    version="2.0_sequential",
+                    content="OpenAI compatible hardened response",
+                    history=["Initial", "Hardened"],
+                ),
+                "current_turn": 2,
+                "token_usage": TokenUsage(input_tokens=50, output_tokens=70, total_tokens=120, llm_calls=3),
+            }
+        }
+
+    monkeypatch.setattr("src.entrypoints.api_server.execute_masc_workflow", fake_workflow)
+
+    chat_resp = test_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "masc-sequential-default",
+            "messages": [{"role": "user", "content": "Explain zero-trust architecture"}],
+            "stream": False,
+        },
+    )
+    assert chat_resp.status_code == 200
+    body = chat_resp.json()
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["message"]["content"] == "OpenAI compatible hardened response"
+    assert body["usage"]["total_tokens"] == 120
+
+
+def test_rate_limiting_enforced(test_client, base_masc_config, monkeypatch):
+    monkeypatch.setattr(settings, "rate_limit_per_minute", 2)
+
+    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+        yield {
+            "synthesize_sequential": {
+                "current_artifact": Artifact(version="2.0", content="ok", history=[]),
+                "current_turn": 2,
+            }
+        }
+
+    monkeypatch.setattr("src.entrypoints.api_server.execute_masc_workflow", fake_workflow)
+    payload = {"task_description": "Test rate limit", "config": base_masc_config.model_dump()}
+
+    assert test_client.post("/v1/masc/execute", json=payload).status_code == 200
+    assert test_client.post("/v1/masc/execute", json=payload).status_code == 200
+    resp_limited = test_client.post("/v1/masc/execute", json=payload)
+    assert resp_limited.status_code == 429

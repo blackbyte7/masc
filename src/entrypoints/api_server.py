@@ -3,9 +3,11 @@ import inspect
 import json
 import logging
 import secrets
+import time
 import uuid
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,12 +19,44 @@ from src.core.engine import (
     close_pg_pool,
     execute_masc_workflow,
     get_thread_checkpoint_state,
+    resume_masc_workflow,
 )
 from src.core.personas import ADVERSARY_PERSONAS, load_personas, resolve_adversary_persona
-from src.core.state import MASCConfig
+from src.core.state import CritiquesCollection, LLMConfig, MASCConfig, PersonaConfig
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Sliding-window rate limit state: client_ip -> deque[timestamps]
+_rate_limit_buckets: dict[str, deque[float]] = defaultdict(deque)
+
+# Preset virtual models exposed by the OpenAI-compatible /v1/models and /v1/chat/completions endpoints
+OPENAI_VIRTUAL_MODELS = {
+    "masc-sequential-default": {
+        "synthesis_protocol": "Sequential Refinement",
+        "adversaries": ["DA", "UncertaintyQuantifier"],
+        "auto_select_adversaries": False,
+        "enable_verification_tools": False,
+    },
+    "masc-architect-default": {
+        "synthesis_protocol": "Architect",
+        "adversaries": ["DA", "ContextualChallenger"],
+        "auto_select_adversaries": False,
+        "enable_verification_tools": False,
+    },
+    "masc-security-audit": {
+        "synthesis_protocol": "Sequential Refinement",
+        "adversaries": ["SecurityHawk", "CodeAuditor"],
+        "auto_select_adversaries": False,
+        "enable_verification_tools": True,
+    },
+    "masc-auto": {
+        "synthesis_protocol": "Sequential Refinement",
+        "adversaries": [],
+        "auto_select_adversaries": True,
+        "enable_verification_tools": True,
+    },
+}
 
 
 @asynccontextmanager
@@ -33,7 +67,7 @@ async def lifespan(app: FastAPI):
     await close_pg_pool()
 
 
-app = FastAPI(title="MASC API", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="MASC API", version="2.3.0", lifespan=lifespan)
 
 allow_origins = settings.cors_origins
 app.add_middleware(
@@ -63,6 +97,34 @@ class MASCRequest(BaseModel):
     )
 
 
+class MASCResumeRequest(BaseModel):
+    approve: bool = Field(
+        default=True,
+        description="If True, resumes synthesis; if False, aborts the paused workflow.",
+    )
+    critiques_collection: Optional[CritiquesCollection] = Field(
+        default=None,
+        description="Optional edited/filtered CritiquesCollection to replace the checkpointed critiques before synthesis.",
+    )
+
+
+class OpenAIChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant", "developer"] = "user"
+    content: str
+
+
+class OpenAIChatCompletionRequest(BaseModel):
+    model: str = Field(default="masc-sequential-default")
+    messages: List[OpenAIChatMessage] = Field(min_length=1)
+    stream: bool = Field(default=False)
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    masc_config: Optional[MASCConfig] = Field(
+        default=None,
+        description="Optional full MASCConfig override for power users calling the OpenAI-compatible endpoint.",
+    )
+
+
 async def verify_api_key(authorization: Optional[str] = Header(default=None)):
     """Enforces constant-time Bearer token authentication when MASC_API_KEY is configured."""
     if not settings.masc_api_key:
@@ -78,6 +140,28 @@ async def verify_api_key(authorization: Optional[str] = Header(default=None)):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key.",
         )
+
+
+async def verify_rate_limit(request: Request):
+    """Enforces a sliding-window per-IP request rate limit when rate_limit_per_minute > 0."""
+    limit = settings.rate_limit_per_minute
+    if limit <= 0:
+        return
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    window_start = now - 60.0
+
+    bucket = _rate_limit_buckets[client_ip]
+    while bucket and bucket[0] < window_start:
+        bucket.popleft()
+
+    if len(bucket) >= limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded ({limit} requests per minute).",
+        )
+    bucket.append(now)
 
 
 def _validate_config_security(config: MASCConfig):
@@ -119,20 +203,16 @@ def _invoke_workflow_generator(
     return execute_masc_workflow(task_description, config, thread_id)
 
 
-async def stream_graph_execution(
-    task_description: str,
-    config: MASCConfig,
+async def _stream_events_from_generator(
+    workflow_gen: Any,
     thread_id: str,
     http_request: Optional[Request] = None,
-    initial_artifact: Optional[str] = None,
 ):
     queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
     async def _producer():
         try:
-            async for state_update in _invoke_workflow_generator(
-                task_description, config, thread_id, initial_artifact=initial_artifact
-            ):
+            async for state_update in workflow_gen:
                 node_name = list(state_update.keys())[0]
                 node_data = state_update[node_name]
 
@@ -191,9 +271,148 @@ async def stream_graph_execution(
             producer_task.cancel()
 
 
+async def stream_graph_execution(
+    task_description: str,
+    config: MASCConfig,
+    thread_id: str,
+    http_request: Optional[Request] = None,
+    initial_artifact: Optional[str] = None,
+):
+    gen = _invoke_workflow_generator(
+        task_description, config, thread_id, initial_artifact=initial_artifact
+    )
+    async for chunk in _stream_events_from_generator(gen, thread_id, http_request):
+        yield chunk
+
+
+def _build_config_from_openai_request(req: OpenAIChatCompletionRequest) -> MASCConfig:
+    if req.masc_config is not None:
+        return req.masc_config
+
+    preset = OPENAI_VIRTUAL_MODELS.get(req.model, OPENAI_VIRTUAL_MODELS["masc-sequential-default"])
+    default_llm = LLMConfig(
+        provider=settings.default_provider,
+        api_key="",
+        model_name=settings.default_model,
+        temperature=req.temperature if req.temperature is not None else settings.default_temperature,
+        max_tokens=req.max_tokens if req.max_tokens is not None else settings.default_max_tokens,
+    )
+    adv_cfgs = [
+        PersonaConfig(persona_name=adv_name, llm_config=default_llm)
+        for adv_name in preset["adversaries"]
+    ]
+    return MASCConfig(
+        proposer=PersonaConfig(persona_name="Proposer", llm_config=default_llm),
+        synthesizer=PersonaConfig(persona_name="Synthesizer", llm_config=default_llm),
+        adversaries=adv_cfgs,
+        auto_select_adversaries=preset["auto_select_adversaries"],
+        synthesis_protocol=preset["synthesis_protocol"],
+        enable_verification_tools=preset["enable_verification_tools"],
+        max_turns=1,
+    )
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
+async def list_openai_models():
+    """OpenAI-compatible model listing endpoint for IDE and UI integrations."""
+    created_ts = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": created_ts,
+                "owned_by": "masc-dialectics",
+            }
+            for model_id in OPENAI_VIRTUAL_MODELS
+        ],
+    }
+
+
+@app.post(
+    "/v1/chat/completions",
+    dependencies=[Depends(verify_api_key), Depends(verify_rate_limit)],
+)
+async def openai_chat_completions(req: OpenAIChatCompletionRequest, request: Request):
+    """OpenAI-compatible chat completions endpoint wrapping the MASC dialectical engine."""
+    config = _build_config_from_openai_request(req)
+    _validate_config_security(config)
+
+    task_parts = [f"[{m.role.upper()}]: {m.content}" for m in req.messages if m.content.strip()]
+    task_description = "\n\n".join(task_parts) if len(req.messages) > 1 else req.messages[-1].content
+    if not task_description.strip():
+        raise HTTPException(status_code=422, detail="Message content cannot be empty.")
+
+    thread_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_ts = int(time.time())
+
+    if not req.stream:
+        final_content = ""
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+
+        async for state in _invoke_workflow_generator(task_description, config, thread_id):
+            node_name = list(state.keys())[0]
+            node_data = state[node_name]
+            if "current_artifact" in node_data and node_data["current_artifact"]:
+                final_content = node_data["current_artifact"].content
+            usage = node_data.get("token_usage")
+            if usage:
+                prompt_tokens = usage.input_tokens
+                completion_tokens = usage.output_tokens
+                total_tokens = usage.total_tokens
+
+        return {
+            "id": thread_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": final_content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
+        }
+
+    async def _openai_sse_stream():
+        final_content = ""
+        async for state in _invoke_workflow_generator(task_description, config, thread_id):
+            node_name = list(state.keys())[0]
+            node_data = state[node_name]
+            if node_name in ("synthesize_sequential", "synthesize_architect") and "current_artifact" in node_data:
+                final_content = node_data["current_artifact"].content
+
+        chunk_payload = {
+            "id": thread_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": final_content},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        yield f"data: {json.dumps(chunk_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_openai_sse_stream(), media_type="text/event-stream")
 
 
 @app.get("/v1/masc/threads/{thread_id}", dependencies=[Depends(verify_api_key)])
@@ -204,7 +423,35 @@ async def get_thread_state(thread_id: str):
     return state
 
 
-@app.post("/v1/masc/execute", dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/v1/masc/threads/{thread_id}/resume",
+    dependencies=[Depends(verify_api_key), Depends(verify_rate_limit)],
+)
+async def resume_thread_workflow(
+    thread_id: str,
+    resume_request: MASCResumeRequest,
+    request: Request,
+):
+    """Resumes a paused Human-in-the-Loop MASC workflow after human inspection or critique editing."""
+    state = await get_thread_checkpoint_state(thread_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found.")
+
+    gen = resume_masc_workflow(
+        thread_id=thread_id,
+        critiques_override=resume_request.critiques_collection,
+        approve=resume_request.approve,
+    )
+    return StreamingResponse(
+        _stream_events_from_generator(gen, thread_id, request),
+        media_type="text/event-stream",
+    )
+
+
+@app.post(
+    "/v1/masc/execute",
+    dependencies=[Depends(verify_api_key), Depends(verify_rate_limit)],
+)
 async def execute_workflow(masc_request: MASCRequest, request: Request):
     if len(masc_request.config.adversaries) > settings.max_adversaries:
         raise HTTPException(
