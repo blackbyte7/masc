@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -204,7 +205,7 @@ def test_get_llm_treats_env_placeholder_as_none(base_masc_config, monkeypatch):
     monkeypatch.setattr("src.core.engine.init_chat_model", fake_init_chat_model)
 
     base_masc_config.proposer.llm_config.api_key = "env"
-    nodes._get_llm(base_masc_config.proposer)
+    nodes.get_llm(base_masc_config.proposer)
     assert captured_kwargs["api_key"] is None
 
 
@@ -214,7 +215,7 @@ def test_get_llm_blocks_env_key_exfiltration_with_custom_base_url(base_masc_conf
     base_masc_config.proposer.llm_config.base_url = "http://localhost:11434"
 
     with pytest.raises(ValueError, match="Explicit API key is required"):
-        nodes._get_llm(base_masc_config.proposer)
+        nodes.get_llm(base_masc_config.proposer)
 
 
 @pytest.mark.asyncio
@@ -340,7 +341,7 @@ async def test_adversarial_analysis_handles_curly_braces_in_system_prompt(base_m
         "critique_type": "CONSTRUCTIVE",
         "system_prompt": 'Audit this JSON structure: {"user_id": 123, "role": "admin"}',
     }
-    critique, _usage = await nodes._run_single_adversary(
+    critique, _usage = await nodes.run_single_adversary(
         adv_config=base_masc_config.adversaries[0],
         name="CustomJSONAuditor",
         persona=persona_with_braces,
@@ -373,7 +374,9 @@ async def test_adversarial_analysis_raises_when_all_fail(base_masc_config, monke
 
 
 @pytest.mark.asyncio
-async def test_synthesize_sequential_batches_per_adversary(base_masc_config, monkeypatch):
+async def test_synthesize_sequential_batches_per_adversary_and_enforces_response_schema(
+    base_masc_config, monkeypatch
+):
     nodes = MASCNodes(settings)
     fake_llm = FakeListChatModel(
         responses=[
@@ -381,7 +384,16 @@ async def test_synthesize_sequential_batches_per_adversary(base_masc_config, mon
             "Draft after fixing all CodeAuditor issues in a single batched pass.",
         ]
     )
+    fake_llm.with_structured_output = lambda _schema: RunnableLambda(
+        lambda _x: {"service": "hardened_db_query", "parameterized": True}
+    )
     monkeypatch.setattr(nodes, "_get_llm", lambda _cfg: fake_llm)
+
+    base_masc_config.response_schema = {
+        "title": "ServiceSpec",
+        "type": "object",
+        "properties": {"service": {"type": "string"}, "parameterized": {"type": "boolean"}},
+    }
 
     critiques = CritiquesCollection(
         critiques=[
@@ -420,9 +432,9 @@ async def test_synthesize_sequential_batches_per_adversary(base_masc_config, mon
 
     assert result["current_turn"] == 2
     assert artifact.version == "2.0_sequential"
-    assert artifact.content == "Draft after fixing all CodeAuditor issues in a single batched pass."
-    assert len(artifact.history) == 4
-    assert result["token_usage"].llm_calls == 2
+    parsed_json = json.loads(artifact.content)
+    assert parsed_json == {"service": "hardened_db_query", "parameterized": True}
+    assert result["token_usage"].llm_calls == 3
 
 
 @pytest.mark.asyncio
@@ -500,7 +512,7 @@ async def test_synthesize_architect_node(base_masc_config, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_human_in_the_loop_interrupt_and_resume(base_masc_config, monkeypatch):
+async def test_human_in_the_loop_interrupt_and_resume_with_override(base_masc_config, monkeypatch):
     base_masc_config.require_human_approval = True
     expected_critique = CritiqueLLMOutput(
         payload=[
@@ -512,20 +524,11 @@ async def test_human_in_the_loop_interrupt_and_resume(base_masc_config, monkeypa
         ]
     )
 
-    def fake_get_llm(self, _cfg):
-        mock = MagicMock()
-        mock.with_structured_output.return_value = RunnableLambda(lambda _x: expected_critique)
-        mock.__or__ = lambda _s, _o: RunnableLambda(lambda _x: MagicMock(content="Synthesized after approval"))
-        return mock
-
-    monkeypatch.setattr(MASCNodes, "_get_llm", fake_get_llm)
-
-    # Allow ChatPromptTemplate | mock_llm to return a fake AIMessage
     fake_chat = FakeListChatModel(responses=["Synthesized after human approval"])
     fake_chat.with_structured_output = lambda _schema: RunnableLambda(lambda _x: expected_critique)
     monkeypatch.setattr(MASCNodes, "_get_llm", lambda _self, _cfg: fake_chat)
 
-    thread_id = "test-hitl-thread-1"
+    thread_id = "test-hitl-thread-override"
     events = []
     async for ev in execute_masc_workflow(
         "Audit this document",
@@ -538,8 +541,30 @@ async def test_human_in_the_loop_interrupt_and_resume(base_masc_config, monkeypa
     assert "__interrupt__" in events[-1]
     assert events[-1]["__interrupt__"]["awaiting_human_approval"] is True
 
+    edited_critiques = CritiquesCollection(
+        critiques=[
+            Critique(
+                source_adversary="HumanReviewer",
+                critique_type="CONSTRUCTIVE",
+                payload=[
+                    CritiqueItem(
+                        severity="CRITICAL",
+                        description="Human-curated security issue",
+                        recommendation="Add mTLS everywhere",
+                    )
+                ],
+            )
+        ]
+    )
+
     resumed_events = []
-    async for ev in resume_masc_workflow(thread_id=thread_id, approve=True):
+    async for ev in resume_masc_workflow(
+        thread_id=thread_id,
+        critiques_override=edited_critiques,
+        approve=True,
+    ):
         resumed_events.append(ev)
 
-    assert any("synthesize_sequential" in ev for ev in resumed_events)
+    synth_events = [ev["synthesize_sequential"] for ev in resumed_events if "synthesize_sequential" in ev]
+    assert len(synth_events) == 1
+    assert any("HumanReviewer" in h for h in synth_events[0]["current_artifact"].history)

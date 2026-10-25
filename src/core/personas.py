@@ -86,6 +86,8 @@ def run_deterministic_verification(persona_name: str, content: str) -> List[str]
     if not content or not content.strip():
         return findings
 
+    logger.debug(f"Running deterministic static verification for adversary '{persona_name}'.")
+
     # 1. Check for hardcoded secret patterns
     for label, pattern in _SECRET_PATTERNS:
         if pattern.search(content):

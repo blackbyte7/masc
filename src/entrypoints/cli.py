@@ -3,11 +3,11 @@ import asyncio
 import logging
 import sys
 import uuid
-from typing import Optional
+from typing import Any, AsyncIterator, Optional
 
 from src.config.settings import settings
-from src.core.engine import close_pg_pool, execute_masc_workflow
-from src.core.state import LLMConfig, MASCConfig, PersonaConfig
+from src.core.engine import close_pg_pool, execute_masc_workflow, resume_masc_workflow
+from src.core.state import LLMConfig, MASCConfig, PersonaConfig, TokenUsage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -34,12 +34,75 @@ def generate_template(filepath: str):
     print(f"✅ Configuration template generated at: {filepath}")
 
 
+async def _consume_cli_stream(
+    stream_gen: AsyncIterator[dict[str, Any]],
+    thread_id: str,
+    auto_approve: bool = False,
+) -> tuple[str, Optional[TokenUsage]]:
+    """Consumes workflow events and interactively handles Human-in-the-Loop (__interrupt__) pauses."""
+    final_content = ""
+    final_usage: Optional[TokenUsage] = None
+    paused_for_approval = False
+
+    async for state in stream_gen:
+        step_name = list(state.keys())[0]
+        node_state = state[step_name]
+
+        if step_name == "__interrupt__":
+            paused_for_approval = True
+            turn = node_state.get("current_turn", 1)
+            critiques_obj = node_state.get("critiques_collection")
+            print(f"\n⏸️  [Turn {turn}] Workflow paused for Human-in-the-Loop approval.")
+            if critiques_obj and hasattr(critiques_obj, "model_dump_json"):
+                print(critiques_obj.model_dump_json(indent=2))
+            break
+
+        if step_name == "aborted":
+            print("\n🛑 Workflow aborted by human reviewer.")
+            return final_content, final_usage
+
+        raw_turn = node_state.get("current_turn", 1)
+        display_turn = (
+            raw_turn - 1
+            if step_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
+            else raw_turn
+        )
+
+        print(f"🔄 [Turn {display_turn}] Executed Node: [ {step_name.upper()} ]")
+
+        if step_name in ("synthesize_sequential", "synthesize_architect") and "current_artifact" in node_state:
+            final_content = node_state["current_artifact"].content
+        if "token_usage" in node_state and isinstance(node_state["token_usage"], TokenUsage):
+            final_usage = node_state["token_usage"]
+
+    if paused_for_approval:
+        if auto_approve or not sys.stdin.isatty():
+            approve = True
+            print("▶️  Auto-approving pending critiques and resuming synthesis...")
+        else:
+            ans = input("\nApprove critiques and proceed to synthesis? [Y/n]: ").strip().lower()
+            approve = ans in ("", "y", "yes")
+
+        resumed_content, resumed_usage = await _consume_cli_stream(
+            resume_masc_workflow(thread_id=thread_id, approve=approve),
+            thread_id=thread_id,
+            auto_approve=auto_approve,
+        )
+        if resumed_content:
+            final_content = resumed_content
+        if resumed_usage is not None:
+            final_usage = resumed_usage
+
+    return final_content, final_usage
+
+
 async def run_cli(
     task: str,
     config_path: str,
     artifact_file: Optional[str] = None,
     auto_personas: bool = False,
     verify_tools: bool = False,
+    auto_approve: bool = False,
 ):
     print("\n" + "=" * 50)
     print("🧠 MASC Enterprise CLI Execution")
@@ -78,33 +141,17 @@ async def run_cli(
     print("-" * 50)
 
     try:
-        final_content = ""
-        final_usage = None
-        async for state in execute_masc_workflow(
-            task, config, thread_id, initial_artifact=initial_artifact
-        ):
-            step_name = list(state.keys())[0]
-            node_state = state[step_name]
-
-            raw_turn = node_state.get("current_turn", 1)
-            display_turn = (
-                raw_turn - 1
-                if step_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
-                else raw_turn
-            )
-
-            print(f"🔄 [Turn {display_turn}] Executed Node: [ {step_name.upper()} ]")
-
-            if step_name in ("synthesize_sequential", "synthesize_architect"):
-                final_content = node_state["current_artifact"].content
-            if "token_usage" in node_state:
-                final_usage = node_state["token_usage"]
+        final_content, final_usage = await _consume_cli_stream(
+            execute_masc_workflow(task, config, thread_id, initial_artifact=initial_artifact),
+            thread_id=thread_id,
+            auto_approve=auto_approve,
+        )
 
         print("\n" + "=" * 50)
         print("🎯 FINAL SYNTHESIS ARTIFACT")
         print("=" * 50)
         print(final_content)
-        if final_usage:
+        if final_usage is not None:
             print(
                 f"\n📊 Token Usage: {final_usage.total_tokens} total "
                 f"({final_usage.input_tokens} in / {final_usage.output_tokens} out across {final_usage.llm_calls} LLM calls)"
@@ -139,6 +186,11 @@ def main():
         help="Optional: enable deterministic static verification checks before adversary critique.",
     )
     parser.add_argument(
+        "--approve-all",
+        action="store_true",
+        help="Automatically approve Human-in-the-Loop breakpoints in non-interactive CI runs.",
+    )
+    parser.add_argument(
         "--generate-template",
         type=str,
         metavar="FILEPATH",
@@ -163,6 +215,7 @@ def main():
             artifact_file=args.initial_artifact,
             auto_personas=args.auto_personas,
             verify_tools=args.verify_tools,
+            auto_approve=args.approve_all,
         )
     )
 

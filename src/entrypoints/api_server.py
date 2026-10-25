@@ -59,15 +59,20 @@ OPENAI_VIRTUAL_MODELS = {
 }
 
 
+def reset_rate_limit_buckets() -> None:
+    """Clears the in-memory sliding-window rate limit buckets."""
+    _rate_limit_buckets.clear()
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     # Startup phase: The pool initializes lazily in engine.py when first needed
     yield
     # Shutdown phase: Teardown async resources
     await close_pg_pool()
 
 
-app = FastAPI(title="MASC API", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title="MASC API", version="2.4.0", lifespan=lifespan)
 
 allow_origins = settings.cors_origins
 app.add_middleware(
@@ -113,10 +118,15 @@ class OpenAIChatMessage(BaseModel):
     content: str
 
 
+class OpenAIStreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class OpenAIChatCompletionRequest(BaseModel):
     model: str = Field(default="masc-sequential-default")
     messages: List[OpenAIChatMessage] = Field(min_length=1)
     stream: bool = Field(default=False)
+    stream_options: Optional[OpenAIStreamOptions] = Field(default=None)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=1)
     masc_config: Optional[MASCConfig] = Field(
@@ -142,20 +152,35 @@ async def verify_api_key(authorization: Optional[str] = Header(default=None)):
         )
 
 
+def _extract_client_ip(request: Request) -> str:
+    """Extracts client IP, respecting X-Forwarded-For when deployed behind a reverse proxy."""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 async def verify_rate_limit(request: Request):
-    """Enforces a sliding-window per-IP request rate limit when rate_limit_per_minute > 0."""
+    """Enforces a sliding-window per-IP request rate limit and prunes expired IP buckets."""
     limit = settings.rate_limit_per_minute
     if limit <= 0:
         return
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _extract_client_ip(request)
     now = time.monotonic()
     window_start = now - 60.0
 
-    bucket = _rate_limit_buckets[client_ip]
-    while bucket and bucket[0] < window_start:
-        bucket.popleft()
+    # Evict expired timestamps across tracked buckets so _rate_limit_buckets never leaks memory
+    stale_ips = []
+    for ip, ip_bucket in list(_rate_limit_buckets.items()):
+        while ip_bucket and ip_bucket[0] < window_start:
+            ip_bucket.popleft()
+        if not ip_bucket and ip != client_ip:
+            stale_ips.append(ip)
+    for ip in stale_ips:
+        _rate_limit_buckets.pop(ip, None)
 
+    bucket = _rate_limit_buckets[client_ip]
     if len(bucket) >= limit:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -193,7 +218,8 @@ def _invoke_workflow_generator(
 ):
     """Calls execute_masc_workflow while remaining compatible with 3-arg test monkeypatches."""
     sig = inspect.signature(execute_masc_workflow)
-    if "initial_artifact" in sig.parameters:
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if "initial_artifact" in sig.parameters or has_var_kw:
         return execute_masc_workflow(
             task_description,
             config,
@@ -287,7 +313,10 @@ async def stream_graph_execution(
 
 def _build_config_from_openai_request(req: OpenAIChatCompletionRequest) -> MASCConfig:
     if req.masc_config is not None:
-        return req.masc_config
+        cfg = req.masc_config.model_copy(deep=True)
+        # Never allow stateless OpenAI chat completions to hang on an unresumable HITL interrupt
+        cfg.require_human_approval = False
+        return cfg
 
     preset = OPENAI_VIRTUAL_MODELS.get(req.model, OPENAI_VIRTUAL_MODELS["masc-sequential-default"])
     default_llm = LLMConfig(
@@ -308,8 +337,60 @@ def _build_config_from_openai_request(req: OpenAIChatCompletionRequest) -> MASCC
         auto_select_adversaries=preset["auto_select_adversaries"],
         synthesis_protocol=preset["synthesis_protocol"],
         enable_verification_tools=preset["enable_verification_tools"],
+        require_human_approval=False,
         max_turns=1,
     )
+
+
+async def _stream_openai_completion_chunks(
+    task_description: str,
+    config: MASCConfig,
+    thread_id: str,
+    created_ts: int,
+    req: OpenAIChatCompletionRequest,
+):
+    """Streams OpenAI-compatible chat.completion.chunk SSE events."""
+    role_chunk = {
+        "id": thread_id,
+        "object": "chat.completion.chunk",
+        "created": created_ts,
+        "model": req.model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+    yield f"data: {json.dumps(role_chunk)}\n\n"
+
+    synthesized_text = ""
+    latest_usage = None
+    async for step_state in _invoke_workflow_generator(task_description, config, thread_id):
+        step_node = list(step_state.keys())[0]
+        step_data = step_state[step_node]
+        if "token_usage" in step_data and step_data["token_usage"]:
+            latest_usage = step_data["token_usage"]
+        if step_node in ("synthesize_sequential", "synthesize_architect") and "current_artifact" in step_data:
+            synthesized_text = step_data["current_artifact"].content
+
+    content_chunk: dict[str, Any] = {
+        "id": thread_id,
+        "object": "chat.completion.chunk",
+        "created": created_ts,
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": synthesized_text},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    if req.stream_options and req.stream_options.include_usage and latest_usage:
+        content_chunk["usage"] = {
+            "prompt_tokens": latest_usage.input_tokens,
+            "completion_tokens": latest_usage.output_tokens,
+            "total_tokens": latest_usage.total_tokens,
+        }
+
+    yield f"data: {json.dumps(content_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @app.get("/health")
@@ -339,7 +420,7 @@ async def list_openai_models():
     "/v1/chat/completions",
     dependencies=[Depends(verify_api_key), Depends(verify_rate_limit)],
 )
-async def openai_chat_completions(req: OpenAIChatCompletionRequest, request: Request):
+async def openai_chat_completions(req: OpenAIChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint wrapping the MASC dialectical engine."""
     config = _build_config_from_openai_request(req)
     _validate_config_security(config)
@@ -388,31 +469,10 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest, request: Req
             },
         }
 
-    async def _openai_sse_stream():
-        final_content = ""
-        async for state in _invoke_workflow_generator(task_description, config, thread_id):
-            node_name = list(state.keys())[0]
-            node_data = state[node_name]
-            if node_name in ("synthesize_sequential", "synthesize_architect") and "current_artifact" in node_data:
-                final_content = node_data["current_artifact"].content
-
-        chunk_payload = {
-            "id": thread_id,
-            "object": "chat.completion.chunk",
-            "created": created_ts,
-            "model": req.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": final_content},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-        yield f"data: {json.dumps(chunk_payload)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(_openai_sse_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_openai_completion_chunks(task_description, config, thread_id, created_ts, req),
+        media_type="text/event-stream",
+    )
 
 
 @app.get("/v1/masc/threads/{thread_id}", dependencies=[Depends(verify_api_key)])

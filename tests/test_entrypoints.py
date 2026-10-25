@@ -21,7 +21,7 @@ def test_cli_generate_template_has_empty_api_key(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mcp_trigger_masc_audit_success(base_masc_config, monkeypatch):
-    async def fake_workflow(task_description, config, thread_id):
+    async def fake_workflow(_task_description, _config, _thread_id, **_kwargs):
         yield {
             "synthesize_sequential": {
                 "current_artifact": Artifact(
@@ -46,7 +46,7 @@ async def test_mcp_trigger_masc_audit_success(base_masc_config, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mcp_resume_masc_audit_success(monkeypatch):
-    async def fake_resume(thread_id, critiques_override=None, approve=True):
+    async def fake_resume(_thread_id, _critiques_override=None, _approve=True, **_kwargs):
         yield {
             "synthesize_sequential": {
                 "current_artifact": Artifact(

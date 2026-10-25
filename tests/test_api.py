@@ -4,14 +4,14 @@ import pytest
 
 from src.config.settings import settings
 from src.core.state import Artifact, TokenUsage
-from src.entrypoints.api_server import _rate_limit_buckets
+from src.entrypoints.api_server import reset_rate_limit_buckets
 
 
 @pytest.fixture(autouse=True)
 def clear_rate_limit_buckets():
-    _rate_limit_buckets.clear()
+    reset_rate_limit_buckets()
     yield
-    _rate_limit_buckets.clear()
+    reset_rate_limit_buckets()
 
 
 def test_health_endpoint(test_client):
@@ -63,7 +63,7 @@ def test_execute_masc_unknown_persona(test_client, base_masc_config):
 
 
 def test_execute_masc_accepts_inline_custom_persona(test_client, base_masc_config, monkeypatch):
-    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+    async def fake_workflow(_task_description, _config, _thread_id, **_kwargs):
         yield {
             "synthesize_sequential": {
                 "current_artifact": Artifact(
@@ -94,7 +94,7 @@ def test_execute_masc_accepts_inline_custom_persona(test_client, base_masc_confi
 def test_execute_masc_accepts_empty_adversaries_when_auto_router_enabled(
     test_client, base_masc_config, monkeypatch
 ):
-    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+    async def fake_workflow(_task_description, _config, _thread_id, **_kwargs):
         yield {
             "synthesize_sequential": {
                 "current_artifact": Artifact(
@@ -167,7 +167,7 @@ def test_execute_masc_auth_guard(test_client, base_masc_config, monkeypatch):
 
 
 def test_execute_masc_sse_stream_and_redaction(test_client, base_masc_config, monkeypatch):
-    async def fake_workflow(task_description, config, thread_id):
+    async def fake_workflow(_task_description, config, _thread_id, **_kwargs):
         yield {
             "propose": {
                 "current_artifact": Artifact(
@@ -232,7 +232,7 @@ def test_openai_models_and_chat_completions_endpoints(test_client, monkeypatch):
     assert "masc-sequential-default" in model_ids
     assert "masc-auto" in model_ids
 
-    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+    async def fake_workflow(_task_description, _config, _thread_id, **_kwargs):
         yield {
             "synthesize_sequential": {
                 "current_artifact": Artifact(
@@ -265,7 +265,7 @@ def test_openai_models_and_chat_completions_endpoints(test_client, monkeypatch):
 def test_rate_limiting_enforced(test_client, base_masc_config, monkeypatch):
     monkeypatch.setattr(settings, "rate_limit_per_minute", 2)
 
-    async def fake_workflow(task_description, config, thread_id, initial_artifact=None):
+    async def fake_workflow(_task_description, _config, _thread_id, **_kwargs):
         yield {
             "synthesize_sequential": {
                 "current_artifact": Artifact(version="2.0", content="ok", history=[]),

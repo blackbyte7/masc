@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import logging
 import traceback
@@ -71,7 +72,7 @@ class _TokenUsageCallback(AsyncCallbackHandler):
         self.output_tokens = 0
         self.total_tokens = 0
 
-    async def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+    async def on_llm_end(self, response: LLMResult, **_kwargs: Any) -> None:
         if response.llm_output and isinstance(response.llm_output, dict):
             token_usage = response.llm_output.get("token_usage") or response.llm_output.get("usage") or {}
             if isinstance(token_usage, dict):
@@ -169,9 +170,11 @@ async def get_thread_checkpoint_state(thread_id: str) -> Optional[dict[str, Any]
             else:
                 safe_values[key] = value
 
+        next_nodes = list(snapshot.next) if snapshot.next else []
         return {
             "thread_id": thread_id,
-            "next": list(snapshot.next) if snapshot.next else [],
+            "awaiting_human_approval": bool(next_nodes),
+            "next": next_nodes,
             "values": safe_values,
         }
 
@@ -208,7 +211,8 @@ class MASCNodes:
     def __init__(self, sys_settings):
         self.settings = sys_settings
 
-    def _get_llm(self, config: PersonaConfig):
+    def get_llm(self, config: PersonaConfig) -> Any:
+        """Initializes the configured chat model with retry policies."""
         provider = config.llm_config.provider
         retry_config = {
             "stop_after_attempt": self.settings.llm_retry_attempts,
@@ -259,6 +263,9 @@ class MASCNodes:
             base_url=validated_base_url,
         ).with_retry(**retry_config)
 
+    # Alias for backward compatibility
+    _get_llm = get_llm
+
     async def _invoke_chain(self, chain: Any, inputs: dict[str, Any]) -> tuple[Any, tuple[int, int, int]]:
         """Executes a LangChain runnable under the global concurrency semaphore and records token usage."""
         sem = _get_llm_semaphore(self.settings.max_concurrent_llm_calls)
@@ -305,6 +312,29 @@ class MASCNodes:
         if hasattr(structured_res, "model_dump_json"):
             return structured_res.model_dump_json(indent=2), updated_usage
         return str(structured_res), updated_usage
+
+    def _is_final_turn(
+        self,
+        next_turn: int,
+        masc_cfg: MASCConfig,
+        critiques_collection: CritiquesCollection,
+        current_usage: TokenUsage,
+    ) -> bool:
+        """Determines whether the workflow will terminate after this synthesis step."""
+        if next_turn > masc_cfg.max_turns:
+            return True
+        if masc_cfg.max_total_tokens is not None and current_usage.total_tokens >= masc_cfg.max_total_tokens:
+            return True
+        if masc_cfg.stop_on_max_severity != "NONE":
+            threshold_rank = SEVERITY_RANK.get(masc_cfg.stop_on_max_severity, 3)
+            has_qualifying_issues = any(
+                SEVERITY_RANK.get(item.severity, 99) <= threshold_rank
+                for critique in critiques_collection.critiques
+                for item in critique.payload
+            )
+            if not has_qualifying_issues:
+                return True
+        return False
 
     async def propose(self, state: MASCState) -> dict:
         logger.info("Entering Proposer Node")
@@ -370,7 +400,7 @@ class MASCNodes:
                 [
                     (
                         "system",
-                        "You are an Chief Audit Router. Select between 1 and 3 adversary personas from the "
+                        "You are a Chief Audit Router. Select between 1 and 3 adversary personas from the "
                         "Available Personas list that are best suited to critique and harden the user's task.",
                     ),
                     (
@@ -430,7 +460,7 @@ class MASCNodes:
         ]
 
         critique_tasks = [
-            self._run_single_adversary(
+            self.run_single_adversary(
                 adv_config=adv_config,
                 name=adv_config.persona_name,
                 persona=persona_def,
@@ -468,7 +498,7 @@ class MASCNodes:
             "token_usage": current_usage,
         }
 
-    async def _run_single_adversary(
+    async def run_single_adversary(
         self,
         adv_config: PersonaConfig,
         name: str,
@@ -531,6 +561,9 @@ class MASCNodes:
             logger.error(f"Adversary '{name}' failed. Error: {e}")
             raise
 
+    # Alias for backward compatibility
+    _run_single_adversary = run_single_adversary
+
     async def triage_critiques(self, state: MASCState) -> dict:
         current_turn = state.get("current_turn", 1)
         logger.info(f"Entering Triage Node (Turn {current_turn})")
@@ -565,7 +598,7 @@ class MASCNodes:
                 (SEVERITY_RANK.get(item.severity, 99) for item in c.payload),
                 default=99,
             )
-            return (type_rank, highest_severity)
+            return type_rank, highest_severity
 
         sorted_critiques.sort(key=_critique_sort_key)
         logger.info("Deterministic triage complete. Processing order established.")
@@ -591,13 +624,15 @@ class MASCNodes:
         actionable_critiques = [c for c in critiques_collection.critiques if c.payload]
         if not actionable_critiques:
             history_log.append(f"[Turn {current_turn}] No actionable critiques required changes.")
-            formatted_content, current_usage = await self._apply_response_schema_if_needed(
-                llm, task_description, current_artifact.content, masc_cfg.response_schema, current_usage
-            )
+            if masc_cfg.response_schema:
+                current_artifact.content, current_usage = await self._apply_response_schema_if_needed(
+                    llm, task_description, current_artifact.content, masc_cfg.response_schema, current_usage
+                )
+                history_log.append(f"[Turn {current_turn}] Enforced structured JSON response_schema.")
             return {
                 "current_artifact": Artifact(
                     version=f"{current_turn + 1}.0_sequential",
-                    content=formatted_content,
+                    content=current_artifact.content,
                     history=history_log,
                 ),
                 "current_turn": current_turn + 1,
@@ -796,20 +831,24 @@ class MASCNodes:
                 f"All sequential synthesis steps failed during Turn {current_turn}. Errors: {'; '.join(errors)}"
             )
 
-        if masc_cfg.response_schema:
+        next_turn = current_turn + 1
+        # Enforce response_schema only on the final turn so intermediate turns remain natural prose/code
+        if masc_cfg.response_schema and self._is_final_turn(
+            next_turn, masc_cfg, critiques_collection, current_usage
+        ):
             current_artifact.content, current_usage = await self._apply_response_schema_if_needed(
                 llm, task_description, current_artifact.content, masc_cfg.response_schema, current_usage
             )
             history_log.append(f"[Turn {current_turn}] Enforced structured JSON response_schema.")
 
         final_artifact = Artifact(
-            version=f"{current_turn + 1}.0_sequential",
+            version=f"{next_turn}.0_sequential",
             content=current_artifact.content,
             history=history_log,
         )
         return {
             "current_artifact": final_artifact,
-            "current_turn": current_turn + 1,
+            "current_turn": next_turn,
             "token_usage": current_usage,
         }
 
@@ -861,7 +900,10 @@ class MASCNodes:
         current_usage = current_usage.add(inp, out, tot, calls=1)
         synthesized_text = str(response.content)
 
-        if masc_cfg.response_schema:
+        next_turn = current_turn + 1
+        if masc_cfg.response_schema and self._is_final_turn(
+            next_turn, masc_cfg, critiques_collection, current_usage
+        ):
             synthesized_text, current_usage = await self._apply_response_schema_if_needed(
                 llm, task_description, synthesized_text, masc_cfg.response_schema, current_usage
             )
@@ -869,14 +911,14 @@ class MASCNodes:
 
         history_log.append(f"[Turn {current_turn}] Architect unified critiques into a hardened artifact.")
         final_artifact = Artifact(
-            version=f"{current_turn + 1}.0_architect",
+            version=f"{next_turn}.0_architect",
             content=synthesized_text,
             history=history_log,
         )
 
         return {
             "current_artifact": final_artifact,
-            "current_turn": current_turn + 1,
+            "current_turn": next_turn,
             "token_usage": current_usage,
         }
 
@@ -1036,16 +1078,16 @@ async def execute_masc_workflow(
     langfuse_handler = None
     if settings.langfuse_public_key and settings.langfuse_secret_key:
         try:
-            from langfuse.callback import CallbackHandler
-
-            langfuse_handler = CallbackHandler(
+            langfuse_mod = importlib.import_module("langfuse.callback")
+            callback_cls: Any = getattr(langfuse_mod, "CallbackHandler")
+            langfuse_handler = callback_cls(
                 public_key=settings.langfuse_public_key,
                 secret_key=settings.langfuse_secret_key,
                 host=settings.langfuse_host,
             )
             run_config["callbacks"] = [langfuse_handler]
             logger.info("Langfuse observability enabled for this execution.")
-        except ImportError:
+        except (ImportError, AttributeError):
             logger.warning("Langfuse keys found, but langfuse package is not installed. Run 'pip install langfuse'.")
 
     if not settings.database_url.startswith("postgres"):
@@ -1086,7 +1128,7 @@ async def resume_masc_workflow(
 ) -> AsyncGenerator[dict, None]:
     """
     Resumes a paused Human-in-the-Loop MASC workflow from its checkpointed state,
-    optionally replacing the critiques_collection with human-curated critiques.
+    preserving HITL breakpoints across subsequent turns if max_turns > 1.
     """
     run_config: dict = {
         "configurable": {"thread_id": thread_id},
@@ -1110,13 +1152,34 @@ async def resume_masc_workflow(
             }
             return
 
+        stored_config: Optional[MASCConfig] = snapshot.values.get("config")
+        protocol = stored_config.synthesis_protocol if stored_config else "Sequential Refinement"
+        as_node_target = "adversarial_analysis" if protocol == "Architect" else "triage_critiques"
+
         if critiques_override is not None:
             await probe_graph.aupdate_state(
                 run_config,
                 {"critiques_collection": critiques_override},
+                as_node=as_node_target,
             )
 
-        # Resume without interrupt_before so the synthesis node executes cleanly
-        resume_graph = build_masc_graph(checkpointer=checkpointer, interrupt_for_approval=False)
+        # Keep interrupt_for_approval enabled so multi-turn workflows pause before synthesis on Turn 2+ as well
+        keep_interrupts = bool(stored_config and stored_config.require_human_approval)
+        resume_graph = build_masc_graph(
+            checkpointer=checkpointer,
+            interrupt_for_approval=keep_interrupts,
+        )
         async for state in resume_graph.astream(None, run_config):
             yield state
+
+        if keep_interrupts:
+            post_snapshot = await resume_graph.aget_state(run_config)
+            if post_snapshot and post_snapshot.next:
+                yield {
+                    "__interrupt__": {
+                        "awaiting_human_approval": True,
+                        "next_nodes": list(post_snapshot.next),
+                        "current_turn": post_snapshot.values.get("current_turn", 1),
+                        "critiques_collection": post_snapshot.values.get("critiques_collection"),
+                    }
+                }

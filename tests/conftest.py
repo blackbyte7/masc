@@ -3,14 +3,14 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-# Set dummy environment variables before importing any MASC modules
+from src.core.state import LLMConfig, MASCConfig, PersonaConfig
+from src.entrypoints.api_server import app
+
+# Set dummy environment variables for test runs
 os.environ["OPENAI_API_KEY"] = "test-key-openai"
 os.environ["ANTHROPIC_API_KEY"] = "test-key-anthropic"
 os.environ["GOOGLE_API_KEY"] = "test-key-google"
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
-
-from src.core.state import LLMConfig, MASCConfig, PersonaConfig
-from src.entrypoints.api_server import app
+os.environ["DATABASE_URL"] = "memory://"
 
 
 @pytest.fixture

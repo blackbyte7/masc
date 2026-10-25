@@ -7,16 +7,16 @@ import gradio as gr
 from fastapi import FastAPI
 
 from src.config.settings import settings, validate_base_url
-from src.core.engine import close_pg_pool, execute_masc_workflow
+from src.core.engine import close_pg_pool, execute_masc_workflow, resume_masc_workflow
 from src.core.personas import ADVERSARY_PERSONAS, load_personas
-from src.core.state import LLMConfig, MASCConfig, PersonaConfig
+from src.core.state import CritiquesCollection, LLMConfig, MASCConfig, PersonaConfig
 from src.utils.model_fetcher import FALLBACK_MODELS, fetch_available_models
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def verify_gradio_auth(username: str, password: str) -> bool:
+def verify_gradio_auth(_username: str, password: str) -> bool:
     """Authenticates Gradio UI sessions against MASC_API_KEY using constant-time comparison."""
     if not settings.masc_api_key:
         return True
@@ -62,18 +62,19 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
         synthesizer_cfg = PersonaConfig(persona_name="Synthesizer", llm_config=synth_llm)
 
         synthesis_protocol_input = config_inputs[12]
-        max_turns_input = int(config_inputs[13])
+        configured_max_turns = int(config_inputs[13])
         stop_severity_input = config_inputs[14]
         batch_constructive_input = bool(config_inputs[15])
         auto_select_adversaries_input = bool(config_inputs[16])
         enable_verification_input = bool(config_inputs[17])
+        require_human_approval_input = bool(config_inputs[18])
 
-        # 3. Unpack Adversaries dynamically (Chunks of 7 starting at index 18)
+        # 3. Unpack Adversaries dynamically (Chunks of 7 starting at index 19)
         adversary_cfgs = []
-        adv_inputs = config_inputs[18:]
+        adv_inputs = config_inputs[19:]
 
-        for i in range(settings.max_adversaries):
-            chunk = adv_inputs[i * 7 : (i + 1) * 7]
+        for slot_idx in range(settings.max_adversaries):
+            chunk = adv_inputs[slot_idx * 7 : (slot_idx + 1) * 7]
             if chunk[0] != "NONE":
                 adv_base_url = validate_base_url(chunk[3], settings) if chunk[3] else None
                 adv_llm_cfg = LLMConfig(
@@ -95,10 +96,11 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
             adversaries=adversary_cfgs,
             auto_select_adversaries=auto_select_adversaries_input,
             synthesis_protocol=synthesis_protocol_input,
-            max_turns=max_turns_input,
+            max_turns=configured_max_turns,
             stop_on_max_severity=stop_severity_input,
             batch_constructive_critiques=batch_constructive_input,
             enable_verification_tools=enable_verification_input,
+            require_human_approval=require_human_approval_input,
             initial_artifact=cleaned_initial_artifact,
         )
 
@@ -109,13 +111,32 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
         initial_proposal_content = cleaned_initial_artifact or ""
         critiques_dict = {"status": "Awaiting adversarial analysis..."}
         final_synthesis_content = ""
-        history_md = "*Workflow initialized...*"
+        history_md = f"*Workflow initialized (Thread ID: `{thread_id}`)...*"
 
         async for state in execute_masc_workflow(
             task_desc, masc_config, thread_id, initial_artifact=cleaned_initial_artifact
         ):
             node_name = list(state.keys())[0]
             node_state = state[node_name]
+
+            if node_name == "__interrupt__":
+                pending_critiques = node_state.get("critiques_collection")
+                if pending_critiques and hasattr(pending_critiques, "model_dump"):
+                    critiques_dict = pending_critiques.model_dump()
+                history_md += (
+                    f"\n- ⏸️ **Paused for Human Approval** on Thread `{thread_id}`. "
+                    "Review or edit the critiques JSON and click **Approve & Resume Synthesis**."
+                )
+                yield (
+                    initial_proposal_content,
+                    critiques_dict,
+                    final_synthesis_content,
+                    history_md,
+                    thread_id,
+                    gr.update(visible=True),
+                )
+                return
+
             raw_turn = node_state.get("current_turn", 1)
             active_turn = (
                 raw_turn - 1
@@ -123,8 +144,8 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
                 else raw_turn
             )
 
-            base_progress = (active_turn - 1) / max_turns_input
-            turn_weight = 1.0 / max_turns_input
+            base_progress = (active_turn - 1) / configured_max_turns
+            turn_weight = 1.0 / configured_max_turns
 
             if "propose" in state:
                 progress(
@@ -136,14 +157,28 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
                 history = state["propose"]["current_artifact"].history
                 history_md = "\n".join([f"- {entry}" for entry in history])
 
-                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
+                yield (
+                    initial_proposal_content,
+                    critiques_dict,
+                    final_synthesis_content,
+                    history_md,
+                    thread_id,
+                    gr.update(visible=False),
+                )
 
             if "route_personas" in state:
                 routed_cfg = state["route_personas"].get("config")
                 if routed_cfg:
                     routed_names = [a.persona_name for a in routed_cfg.adversaries]
                     critiques_dict = {"auto_selected_adversaries": routed_names}
-                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
+                yield (
+                    initial_proposal_content,
+                    critiques_dict,
+                    final_synthesis_content,
+                    history_md,
+                    thread_id,
+                    gr.update(visible=False),
+                )
 
             if "adversarial_analysis" in state:
                 progress(
@@ -157,7 +192,14 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
                 else:
                     critiques_dict = {"critiques": []}
 
-                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
+                yield (
+                    initial_proposal_content,
+                    critiques_dict,
+                    final_synthesis_content,
+                    history_md,
+                    thread_id,
+                    gr.update(visible=False),
+                )
 
             if "synthesize_sequential" in state or "synthesize_architect" in state:
                 progress(
@@ -177,15 +219,69 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
                 )
                 history_md = "\n".join([f"- {entry}" for entry in history]) + usage_line
 
-                yield initial_proposal_content, critiques_dict, final_synthesis_content, history_md
+                yield (
+                    initial_proposal_content,
+                    critiques_dict,
+                    final_synthesis_content,
+                    history_md,
+                    thread_id,
+                    gr.update(visible=False),
+                )
 
-        progress(1.0, desc=f"Workflow Finished after {max_turns_input} cycle(s)!")
+        progress(1.0, desc=f"Workflow Finished after {configured_max_turns} cycle(s)!")
 
     except gr.Error:
         raise
     except Exception as e:
         logger.exception(f"Gradio execution error: {e}")
         raise gr.Error(f"Execution failed: {e}")
+
+
+async def handle_hitl_resume(thread_id: str, critiques_data, approve: bool):
+    """Resumes or aborts a paused Human-in-the-Loop workflow from the Gradio Studio UI."""
+    if not thread_id:
+        raise gr.Error("No active paused thread ID found.")
+
+    override = None
+    if approve and isinstance(critiques_data, dict) and "critiques" in critiques_data:
+        override = CritiquesCollection.model_validate(critiques_data)
+
+    final_synthesis_content = ""
+    history_md = f"*Resuming thread `{thread_id}`...*"
+
+    async for state in resume_masc_workflow(
+        thread_id=thread_id,
+        critiques_override=override,
+        approve=approve,
+    ):
+        node_name = list(state.keys())[0]
+        node_state = state[node_name]
+
+        if node_name == "aborted":
+            history_md = f"- 🛑 Workflow on thread `{thread_id}` was rejected and aborted by reviewer."
+            yield gr.skip(), final_synthesis_content, history_md, gr.update(visible=False)
+            return
+
+        if node_name == "__interrupt__":
+            pending = node_state.get("critiques_collection")
+            updated_critiques = pending.model_dump() if hasattr(pending, "model_dump") else gr.skip()
+            history_md += f"\n- ⏸️ Paused for Human Approval on Turn {node_state.get('current_turn', 1)}."
+            yield updated_critiques, final_synthesis_content, history_md, gr.update(visible=True)
+            return
+
+        if node_name in ("synthesize_sequential", "synthesize_architect") and "current_artifact" in node_state:
+            final_synthesis_content = node_state["current_artifact"].content
+            history = node_state["current_artifact"].history
+            usage = node_state.get("token_usage")
+            usage_line = (
+                f"\n\n---\n**Cumulative Token Usage:** {usage.total_tokens} tokens "
+                f"({usage.input_tokens} prompt / {usage.output_tokens} completion across {usage.llm_calls} LLM calls)"
+                if usage
+                else ""
+            )
+            history_md = "\n".join([f"- {entry}" for entry in history]) + usage_line
+
+    yield gr.skip(), final_synthesis_content, history_md, gr.update(visible=False)
 
 
 def create_persona_ui(persona_name, is_adversary=False):
@@ -273,7 +369,7 @@ def create_persona_ui(persona_name, is_adversary=False):
 
 # FastAPI
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     # Startup: the PG pool initializes dynamically when engine.py needs it
     yield
     # Shutdown: Safely drain and close the connection pool to prevent zombie connections
@@ -282,98 +378,141 @@ async def lifespan(app: FastAPI):
 
 fastapi_app = FastAPI(title="MASC Enterprise Studio UI", lifespan=lifespan)
 
-# --- Gradio UI Layout ---
-with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as app:
-    gr.Markdown("# MASC: Advanced Workflow Studio")
-    all_ui_inputs = []
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("## 1. Task & Optional Initial Artifact")
-            task_description_input = gr.Textbox(label="High-Level Goal / Audit Criteria", lines=4)
-            all_ui_inputs.append(task_description_input)
+@fastapi_app.get("/health")
+async def ui_health_check():
+    """Unauthenticated healthcheck endpoint so container probes succeed when Gradio auth is enabled."""
+    return {"status": "healthy"}
 
-            initial_artifact_input = gr.Textbox(
-                label="Existing Artifact to Audit (Optional - Leave blank to generate from scratch)",
-                placeholder="Paste existing code, architecture proposal, or policy document here to skip the Proposer step...",
-                lines=4,
-            )
-            all_ui_inputs.append(initial_artifact_input)
 
-            gr.Markdown("## 2. Workflow Configuration")
-            with gr.Tabs():
-                with gr.TabItem("Core Roles & Settings"):
-                    all_ui_inputs.extend(create_persona_ui("Proposer"))
-                    all_ui_inputs.extend(create_persona_ui("Synthesizer"))
+def build_gradio_blocks() -> gr.Blocks:
+    """Constructs the Gradio Studio interface without polluting module-level scope."""
+    with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as blocks:
+        gr.Markdown("# MASC: Advanced Workflow Studio")
+        all_ui_inputs = []
+        active_thread_state = gr.State(value="")
 
-                    synthesis_protocol_selector = gr.Radio(
-                        label="Synthesis Protocol",
-                        choices=["Sequential Refinement", "Architect"],
-                        value="Sequential Refinement",
-                    )
-                    all_ui_inputs.append(synthesis_protocol_selector)
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("## 1. Task & Optional Initial Artifact")
+                task_description_input = gr.Textbox(label="High-Level Goal / Audit Criteria", lines=4)
+                all_ui_inputs.append(task_description_input)
 
-                    max_turns_input = gr.Slider(
-                        label="Max Critique Cycles",
-                        minimum=1,
-                        maximum=settings.max_turns_limit,
-                        step=1,
-                        value=1,
-                        info="Number of times the artifact loops back through adversarial critique.",
-                    )
-                    all_ui_inputs.append(max_turns_input)
+                initial_artifact_input = gr.Textbox(
+                    label="Existing Artifact to Audit (Optional - Leave blank to generate from scratch)",
+                    placeholder="Paste existing code, architecture proposal, or policy document here to skip the Proposer step...",
+                    lines=4,
+                )
+                all_ui_inputs.append(initial_artifact_input)
 
-                    stop_severity_selector = gr.Dropdown(
-                        label="Early Convergence Threshold (Stop when no issues >= severity)",
-                        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"],
-                        value="LOW",
-                    )
-                    all_ui_inputs.append(stop_severity_selector)
+                gr.Markdown("## 2. Workflow Configuration")
+                with gr.Tabs():
+                    with gr.TabItem("Core Roles & Settings"):
+                        all_ui_inputs.extend(create_persona_ui("Proposer"))
+                        all_ui_inputs.extend(create_persona_ui("Synthesizer"))
 
-                    batch_constructive_checkbox = gr.Checkbox(
-                        label="Batch Constructive Critiques in Sequential Mode",
-                        value=False,
-                        info="Applies all constructive fixes in a single pass per turn to reduce latency and token usage.",
-                    )
-                    all_ui_inputs.append(batch_constructive_checkbox)
+                        synthesis_protocol_selector = gr.Radio(
+                            label="Synthesis Protocol",
+                            choices=["Sequential Refinement", "Architect"],
+                            value="Sequential Refinement",
+                        )
+                        all_ui_inputs.append(synthesis_protocol_selector)
 
-                    auto_select_adversaries_checkbox = gr.Checkbox(
-                        label="Auto-Select Adversaries (Optional Router)",
-                        value=False,
-                        info="Automatically selects relevant adversary personas based on the task description.",
-                    )
-                    all_ui_inputs.append(auto_select_adversaries_checkbox)
+                        max_turns_slider = gr.Slider(
+                            label="Max Critique Cycles",
+                            minimum=1,
+                            maximum=settings.max_turns_limit,
+                            step=1,
+                            value=1,
+                            info="Number of times the artifact loops back through adversarial critique.",
+                        )
+                        all_ui_inputs.append(max_turns_slider)
 
-                    enable_verification_checkbox = gr.Checkbox(
-                        label="Enable Deterministic Static Verification Tools (Optional)",
-                        value=False,
-                        info="Runs AST syntax, dangerous call, and secret checks to ground adversary critiques.",
-                    )
-                    all_ui_inputs.append(enable_verification_checkbox)
+                        stop_severity_selector = gr.Dropdown(
+                            label="Early Convergence Threshold (Stop when no issues >= severity)",
+                            choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"],
+                            value="LOW",
+                        )
+                        all_ui_inputs.append(stop_severity_selector)
 
-                with gr.TabItem("Adversaries"):
-                    for i in range(settings.max_adversaries):
-                        all_ui_inputs.extend(create_persona_ui(f"Adversary Slot {i + 1}", is_adversary=True))
+                        batch_constructive_checkbox = gr.Checkbox(
+                            label="Batch Constructive Critiques in Sequential Mode",
+                            value=False,
+                            info="Applies all constructive fixes in a single pass per turn to reduce latency and token usage.",
+                        )
+                        all_ui_inputs.append(batch_constructive_checkbox)
 
-            run_button = gr.Button("Execute Graph", variant="primary")
+                        auto_select_adversaries_checkbox = gr.Checkbox(
+                            label="Auto-Select Adversaries (Optional Router)",
+                            value=False,
+                            info="Automatically selects relevant adversary personas based on the task description.",
+                        )
+                        all_ui_inputs.append(auto_select_adversaries_checkbox)
 
-        with gr.Column(scale=2):
-            gr.Markdown("## 3. Telemetry & Results")
-            with gr.Tabs():
-                with gr.TabItem("Current Synthesis"):
-                    final_synthesis_output = gr.Markdown(label="Hardened Artifact")
-                with gr.TabItem("Process Breakdown"):
-                    v1_proposal_output = gr.Markdown("### Initial Proposal / Input Artifact")
-                    critiques_output = gr.JSON(label="Latest Adversarial Critiques")
-                with gr.TabItem("Refinement History & Token Log"):
-                    history_output = gr.Markdown()
+                        enable_verification_checkbox = gr.Checkbox(
+                            label="Enable Deterministic Static Verification Tools (Optional)",
+                            value=False,
+                            info="Runs AST syntax, dangerous call, and secret checks to ground adversary critiques.",
+                        )
+                        all_ui_inputs.append(enable_verification_checkbox)
 
-    run_button.click(
-        fn=run_masc_t_cycle,
-        inputs=all_ui_inputs,
-        outputs=[v1_proposal_output, critiques_output, final_synthesis_output, history_output],
-    )
+                        require_human_approval_checkbox = gr.Checkbox(
+                            label="Require Human Approval before Synthesis (HITL Breakpoint)",
+                            value=False,
+                            info="Pauses execution after adversarial critique so you can review or approve before synthesis.",
+                        )
+                        all_ui_inputs.append(require_human_approval_checkbox)
 
+                    with gr.TabItem("Adversaries"):
+                        for adv_idx in range(settings.max_adversaries):
+                            all_ui_inputs.extend(create_persona_ui(f"Adversary Slot {adv_idx + 1}", is_adversary=True))
+
+                run_button = gr.Button("Execute Graph", variant="primary")
+
+                with gr.Row(visible=False) as hitl_controls_row:
+                    approve_resume_btn = gr.Button("✅ Approve & Resume Synthesis", variant="secondary")
+                    reject_abort_btn = gr.Button("🛑 Reject & Abort", variant="stop")
+
+            with gr.Column(scale=2):
+                gr.Markdown("## 3. Telemetry & Results")
+                with gr.Tabs():
+                    with gr.TabItem("Current Synthesis"):
+                        final_synthesis_output = gr.Markdown(label="Hardened Artifact")
+                    with gr.TabItem("Process Breakdown"):
+                        v1_proposal_output = gr.Markdown("### Initial Proposal / Input Artifact")
+                        critiques_output = gr.JSON(label="Latest Adversarial Critiques")
+                    with gr.TabItem("Refinement History & Token Log"):
+                        history_output = gr.Markdown()
+
+        run_button.click(
+            fn=run_masc_t_cycle,
+            inputs=all_ui_inputs,
+            outputs=[
+                v1_proposal_output,
+                critiques_output,
+                final_synthesis_output,
+                history_output,
+                active_thread_state,
+                hitl_controls_row,
+            ],
+        )
+
+        approve_resume_btn.click(
+            fn=lambda tid, c_json: handle_hitl_resume(tid, c_json, True),
+            inputs=[active_thread_state, critiques_output],
+            outputs=[critiques_output, final_synthesis_output, history_output, hitl_controls_row],
+        )
+
+        reject_abort_btn.click(
+            fn=lambda tid, c_json: handle_hitl_resume(tid, c_json, False),
+            inputs=[active_thread_state, critiques_output],
+            outputs=[critiques_output, final_synthesis_output, history_output, hitl_controls_row],
+        )
+
+    return blocks
+
+
+app = build_gradio_blocks()
 fastapi_app = gr.mount_gradio_app(
     fastapi_app,
     app,
