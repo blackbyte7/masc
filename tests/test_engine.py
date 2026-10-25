@@ -1,9 +1,11 @@
 import json
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import Runnable, RunnableLambda
+from pydantic import PrivateAttr
 
 from src.config.settings import settings
 from src.core.engine import (
@@ -26,6 +28,20 @@ from src.core.state import (
     PersonaRouterOutput,
     TokenUsage,
 )
+
+
+class _StructuredFakeChatModel(FakeListChatModel):
+    """Pydantic-compatible FakeListChatModel subclass that supports .with_structured_output()."""
+
+    _structured_result: Any = PrivateAttr(default=None)
+
+    def __init__(self, responses: list[str], structured_result: Any = None, **kwargs: Any) -> None:
+        super().__init__(responses=responses, **kwargs)
+        self._structured_result = structured_result
+
+    def with_structured_output(self, _schema: Any, **_kwargs: Any) -> Runnable:
+        result = self._structured_result
+        return RunnableLambda(lambda _x: result)
 
 
 @pytest.mark.asyncio
@@ -378,14 +394,12 @@ async def test_synthesize_sequential_batches_per_adversary_and_enforces_response
     base_masc_config, monkeypatch
 ):
     nodes = MASCNodes(settings)
-    fake_llm = FakeListChatModel(
+    fake_llm = _StructuredFakeChatModel(
         responses=[
             "Draft after refuting DA.",
             "Draft after fixing all CodeAuditor issues in a single batched pass.",
-        ]
-    )
-    fake_llm.with_structured_output = lambda _schema: RunnableLambda(
-        lambda _x: {"service": "hardened_db_query", "parameterized": True}
+        ],
+        structured_result={"service": "hardened_db_query", "parameterized": True},
     )
     monkeypatch.setattr(nodes, "_get_llm", lambda _cfg: fake_llm)
 
@@ -524,8 +538,10 @@ async def test_human_in_the_loop_interrupt_and_resume_with_override(base_masc_co
         ]
     )
 
-    fake_chat = FakeListChatModel(responses=["Synthesized after human approval"])
-    fake_chat.with_structured_output = lambda _schema: RunnableLambda(lambda _x: expected_critique)
+    fake_chat = _StructuredFakeChatModel(
+        responses=["Synthesized after human approval"],
+        structured_result=expected_critique,
+    )
     monkeypatch.setattr(MASCNodes, "_get_llm", lambda _self, _cfg: fake_chat)
 
     thread_id = "test-hitl-thread-override"

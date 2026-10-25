@@ -74,7 +74,7 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
         adv_inputs = config_inputs[19:]
 
         for slot_idx in range(settings.max_adversaries):
-            chunk = adv_inputs[slot_idx * 7 : (slot_idx + 1) * 7]
+            chunk = adv_inputs[slot_idx * 7: (slot_idx + 1) * 7]
             if chunk[0] != "NONE":
                 adv_base_url = validate_base_url(chunk[3], settings) if chunk[3] else None
                 adv_llm_cfg = LLMConfig(

@@ -1,11 +1,10 @@
+import importlib
 import inspect
 import json
 import logging
 import sys
 import uuid
-from typing import Optional
-
-from mcp.server.fastmcp import FastMCP
+from typing import Any, Optional
 
 from src.config.settings import settings, validate_base_url
 from src.core.engine import close_pg_pool, execute_masc_workflow, resume_masc_workflow
@@ -19,10 +18,48 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-mcp = FastMCP("MASC-Dialectics")
+
+class _FallbackMCP:
+    """Lightweight fallback when neither 'mcp' nor 'fastmcp' is installed in a test environment."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    @staticmethod
+    def tool():
+        def _decorator(func: Any) -> Any:
+            return func
+
+        return _decorator
+
+    @staticmethod
+    def run() -> None:
+        raise RuntimeError("Neither 'mcp' nor 'fastmcp' package is installed. Run: pip install mcp fastmcp")
 
 
-@mcp.tool()
+def _create_mcp_server(server_name: str) -> Any:
+    """Initializes FastMCP dynamically to avoid IDE stub resolution conflicts across mcp/fastmcp versions."""
+    for module_name in ("mcp.server.fastmcp", "fastmcp"):
+        try:
+            mod = importlib.import_module(module_name)
+            fastmcp_cls: Any = getattr(mod, "FastMCP", None)
+            if callable(fastmcp_cls):
+                return fastmcp_cls(server_name)
+        except ImportError:
+            continue
+    return _FallbackMCP(server_name)
+
+
+def _register_mcp_tool(server: Any, func: Any) -> None:
+    """Registers an async function with FastMCP while keeping the function directly awaitable for unit tests."""
+    tool_decorator = getattr(server, "tool", None)
+    if callable(tool_decorator):
+        tool_decorator()(func)
+
+
+mcp = _create_mcp_server("MASC-Dialectics")
+
+
 async def trigger_masc_audit(
     task_description: str,
     config_json: str,
@@ -66,7 +103,8 @@ async def trigger_masc_audit(
         final_state = None
 
         sig = inspect.signature(execute_masc_workflow)
-        if "initial_artifact" in sig.parameters:
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if "initial_artifact" in sig.parameters or has_var_kw:
             workflow_gen = execute_masc_workflow(
                 task_description, config, thread_id, initial_artifact=initial_artifact
             )
@@ -110,7 +148,6 @@ async def trigger_masc_audit(
         await close_pg_pool()
 
 
-@mcp.tool()
 async def resume_masc_audit(
     thread_id: str,
     approve: bool = True,
@@ -159,6 +196,10 @@ async def resume_masc_audit(
         return f"MASC Resume Error: {str(e)}"
     finally:
         await close_pg_pool()
+
+
+_register_mcp_tool(mcp, trigger_masc_audit)
+_register_mcp_tool(mcp, resume_masc_audit)
 
 
 if __name__ == "__main__":
