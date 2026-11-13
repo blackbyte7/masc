@@ -1,4 +1,5 @@
 import json
+
 import pytest
 
 from src.core.personas import load_personas, resolve_adversary_persona

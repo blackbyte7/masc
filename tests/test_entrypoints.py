@@ -76,3 +76,56 @@ async def test_model_fetcher_returns_fallbacks_when_no_key():
 async def test_model_fetcher_blocks_disallowed_base_url():
     models = await fetch_available_models("Ollama", base_url="http://169.254.169.254/latest")
     assert models == FALLBACK_MODELS["Ollama"]
+
+
+@pytest.mark.asyncio
+async def test_cli_does_not_auto_approve_hitl_without_flag(monkeypatch):
+    from src.core.state import CritiquesCollection
+    from src.entrypoints import cli
+
+    resumed = []
+
+    async def fake_stream():
+        yield {"__interrupt__": {"current_turn": 1, "critiques_collection": CritiquesCollection(critiques=[])}}
+
+    def fake_resume(**kwargs):
+        resumed.append(kwargs)
+        raise AssertionError("must not resume without --approve-all in a non-interactive session")
+
+    monkeypatch.setattr(cli, "resume_masc_workflow", fake_resume)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+
+    content, usage = await cli._consume_cli_stream(fake_stream(), thread_id="t-cli", auto_approve=False)
+    assert content == "" and usage is None
+    assert resumed == []
+
+
+@pytest.mark.asyncio
+async def test_cli_auto_approves_with_flag(monkeypatch):
+    from src.core.state import CritiquesCollection
+    from src.entrypoints import cli
+
+    async def fake_stream():
+        yield {"__interrupt__": {"current_turn": 1, "critiques_collection": CritiquesCollection(critiques=[])}}
+
+    async def fake_resume(**_kwargs):
+        yield {
+            "synthesize_sequential": {"current_artifact": Artifact(version="2", content="approved"), "current_turn": 2}
+        }
+
+    monkeypatch.setattr(cli, "resume_masc_workflow", fake_resume)
+    content, _ = await cli._consume_cli_stream(fake_stream(), thread_id="t-cli", auto_approve=True)
+    assert content == "approved"
+
+
+@pytest.mark.asyncio
+async def test_cli_rejects_invalid_config(tmp_path, base_masc_config):
+    from src.entrypoints import cli
+
+    base_masc_config.adversaries[0].persona_name = "DoesNotExist"
+    cfg_file = tmp_path / "cfg.json"
+    cfg_file.write_text(base_masc_config.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        await cli.run_cli("Audit", str(cfg_file))
+    assert exc.value.code == 1

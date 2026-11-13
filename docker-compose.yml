@@ -1,60 +1,67 @@
+# MASC local / single-host deployment.
+#   docker compose up -d                 -> PostgreSQL + API (:8000) + Gradio Studio (:7860)
+#   docker compose run --rm -i masc-mcp  -> MCP stdio server (see README)
+#
+# Configuration is read from .env (copy .env.example). Change POSTGRES_PASSWORD and set
+# MASC_API_KEY before exposing these services beyond localhost.
+
+x-masc-common: &masc-common
+  build: .
+  image: masc:latest
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  environment: &masc-env
+    DATABASE_URL: postgresql://${POSTGRES_USER:-masc_user}:${POSTGRES_PASSWORD:-masc_pass}@postgres:5432/${POSTGRES_DB:-masc_db}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+    LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+    LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+    LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+    MASC_API_KEY: ${MASC_API_KEY:-}
+    TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
   masc-api:
-    build: .
+    <<: *masc-common
     ports:
       - "8000:8000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-masc_user}:${POSTGRES_PASSWORD:-masc_pass}@postgres:5432/${POSTGRES_DB:-masc_db}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
-      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
-      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
-      - MASC_API_KEY=${MASC_API_KEY:-}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      <<: *masc-env
+      MASC_HEALTH_PORT: "8000"
     command: ["python", "main.py", "--mode", "api"]
 
   masc-ui:
-    build: .
+    <<: *masc-common
     ports:
       - "7860:7860"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-masc_user}:${POSTGRES_PASSWORD:-masc_pass}@postgres:5432/${POSTGRES_DB:-masc_db}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
-      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
-      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
-      - MASC_API_KEY=${MASC_API_KEY:-}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health')"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+      <<: *masc-env
+      MASC_HEALTH_PORT: "7860"
     command: ["python", "main.py", "--mode", "ui"]
 
+  # On-demand stdio MCP server (no ports, no restart, no healthcheck).
+  masc-mcp:
+    <<: *masc-common
+    restart: "no"
+    profiles: ["mcp"]
+    stdin_open: true
+    healthcheck:
+      disable: true
+    command: ["python", "main.py", "--mode", "mcp"]
+
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15-alpine  # keep the major version stable: upgrading requires migrating the pgdata volume
+    restart: unless-stopped
     environment:
-      - POSTGRES_USER=${POSTGRES_USER:-masc_user}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-masc_pass}
-      - POSTGRES_DB=${POSTGRES_DB:-masc_db}
+      POSTGRES_USER: ${POSTGRES_USER:-masc_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-masc_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-masc_db}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:

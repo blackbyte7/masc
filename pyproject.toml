@@ -1,0 +1,114 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "masc"
+dynamic = ["version"]
+description = "Modular Adversarial Synergy Chain: a dialectical, multi-agent adversarial hardening engine built on LangGraph."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Alexander Schneider" }]
+requires-python = ">=3.10"
+keywords = ["llm", "agents", "langgraph", "adversarial", "red-teaming", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Keep in sync with requirements.txt (used by the Docker image).
+dependencies = [
+    "fastapi>=0.115.0,<1.0",
+    "uvicorn[standard]>=0.36.0,<1.0",
+    "mcp>=1.2.0,<3.0",
+    "gradio>=6.0.0,<7.0",
+    "httpx>=0.27.0,<1.0",
+    "langchain>=1.0.0,<2.0",
+    "langchain-core>=1.0.0,<2.0",
+    "langgraph>=1.0.0,<2.0",
+    "langgraph-checkpoint>=3.0.0,<5.0",
+    "langgraph-checkpoint-postgres>=3.0.0,<4.0",
+    "langchain-openai>=1.0.0,<2.0",
+    "langchain-anthropic>=1.0.0,<2.0",
+    "langchain-google-genai>=3.0.0,<5.0",
+    "langchain-ollama>=1.0.0,<2.0",
+    "pydantic>=2.9.0,<3.0",
+    "pydantic-settings>=2.5.0,<3.0",
+    "langfuse>=3.0.0,<5.0",
+    "psycopg[binary,pool]>=3.2.0,<4.0",
+    "python-dotenv>=1.0.1,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+masc = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/blackbyte7/masc"
+Issues = "https://github.com/blackbyte7/masc/issues"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "src.__version__" }
+
+# ------------------------------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning:langchain_core.*",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+# ------------------------------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".venv", "venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC"]
+ignore = [
+    "E501",   # line length is handled by the formatter / reviewer judgement
+    "UP006",  # keep typing.List/Dict for readability parity with pydantic models
+    "UP007",
+    "UP035",
+    "UP045",
+    "S104",   # binding to 0.0.0.0 is intentional for containerised servers
+    "B008",   # FastAPI dependency injection uses calls in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "B011"]
+"main.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]

@@ -151,12 +151,8 @@ class CritiqueItem(BaseModel):
     severity: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"] = Field(
         description="Severity of the identified issue ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')."
     )
-    description: str = Field(
-        description="Detailed explanation of the vulnerability, blind spot, or counter-argument."
-    )
-    recommendation: str = Field(
-        description="Concrete recommendation to resolve the issue or refute the challenge."
-    )
+    description: str = Field(description="Detailed explanation of the vulnerability, blind spot, or counter-argument.")
+    recommendation: str = Field(description="Concrete recommendation to resolve the issue or refute the challenge.")
 
     def get(self, key: str, default: Any = None) -> Any:
         """Provides dictionary-style `.get()` compatibility alongside attribute access."""

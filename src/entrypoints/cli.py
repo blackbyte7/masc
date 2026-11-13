@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import logging
 import sys
 import uuid
 from typing import Any, AsyncIterator, Optional
@@ -8,8 +7,9 @@ from typing import Any, AsyncIterator, Optional
 from src.config.settings import settings
 from src.core.engine import close_pg_pool, execute_masc_workflow, resume_masc_workflow
 from src.core.state import LLMConfig, MASCConfig, PersonaConfig, TokenUsage
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from src.core.validation import ConfigValidationError, validate_masc_config, validate_task_inputs
+from src.utils.logging_config import configure_logging
+from src.utils.runtime import run_async
 
 
 def generate_template(filepath: str):
@@ -44,44 +44,57 @@ async def _consume_cli_stream(
     final_usage: Optional[TokenUsage] = None
     paused_for_approval = False
 
-    async for state in stream_gen:
-        step_name = list(state.keys())[0]
-        node_state = state[step_name]
+    try:
+        async for state in stream_gen:
+            step_name = next(iter(state))
+            node_state = state[step_name]
 
-        if step_name == "__interrupt__":
-            paused_for_approval = True
-            turn = node_state.get("current_turn", 1)
-            critiques_obj = node_state.get("critiques_collection")
-            print(f"\n⏸️  [Turn {turn}] Workflow paused for Human-in-the-Loop approval.")
-            if critiques_obj and hasattr(critiques_obj, "model_dump_json"):
-                print(critiques_obj.model_dump_json(indent=2))
-            break
+            if step_name == "__interrupt__":
+                paused_for_approval = True
+                turn = node_state.get("current_turn", 1)
+                critiques_obj = node_state.get("critiques_collection")
+                print(f"\n⏸️  [Turn {turn}] Workflow paused for Human-in-the-Loop approval.")
+                if critiques_obj and hasattr(critiques_obj, "model_dump_json"):
+                    print(critiques_obj.model_dump_json(indent=2))
+                break
 
-        if step_name == "aborted":
-            print("\n🛑 Workflow aborted by human reviewer.")
-            return final_content, final_usage
+            if step_name == "aborted":
+                print("\n🛑 Workflow aborted by human reviewer.")
+                return final_content, final_usage
 
-        raw_turn = node_state.get("current_turn", 1)
-        display_turn = (
-            raw_turn - 1
-            if step_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
-            else raw_turn
-        )
+            raw_turn = node_state.get("current_turn", 1)
+            display_turn = (
+                raw_turn - 1
+                if step_name in ("synthesize_sequential", "synthesize_architect") and raw_turn > 1
+                else raw_turn
+            )
 
-        print(f"🔄 [Turn {display_turn}] Executed Node: [ {step_name.upper()} ]")
+            print(f"🔄 [Turn {display_turn}] Executed Node: [ {step_name.upper()} ]")
 
-        if step_name in ("synthesize_sequential", "synthesize_architect") and "current_artifact" in node_state:
-            final_content = node_state["current_artifact"].content
-        if "token_usage" in node_state and isinstance(node_state["token_usage"], TokenUsage):
-            final_usage = node_state["token_usage"]
+            if step_name in ("synthesize_sequential", "synthesize_architect") and "current_artifact" in node_state:
+                final_content = node_state["current_artifact"].content
+            if "token_usage" in node_state and isinstance(node_state["token_usage"], TokenUsage):
+                final_usage = node_state["token_usage"]
+    finally:
+        # Release the checkpointer context held by the generator before resuming on a new one.
+        aclose = getattr(stream_gen, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     if paused_for_approval:
-        if auto_approve or not sys.stdin.isatty():
+        if auto_approve:
             approve = True
-            print("▶️  Auto-approving pending critiques and resuming synthesis...")
+            print("▶️  Auto-approving pending critiques and resuming synthesis (--approve-all)...")
+        elif not sys.stdin.isatty():
+            # Never silently approve a Human-in-the-Loop gate just because no terminal is attached.
+            print(
+                f"\n⏸️  Non-interactive session: thread '{thread_id}' remains paused for approval. "
+                "Re-run with --approve-all to approve automatically, or resume it via the API/MCP."
+            )
+            return final_content, final_usage
         else:
-            ans = input("\nApprove critiques and proceed to synthesis? [Y/n]: ").strip().lower()
-            approve = ans in ("", "y", "yes")
+            ans = await asyncio.to_thread(input, "\nApprove critiques and proceed to synthesis? [Y/n]: ")
+            approve = ans.strip().lower() in ("", "y", "yes")
 
         resumed_content, resumed_usage = await _consume_cli_stream(
             resume_masc_workflow(thread_id=thread_id, approve=approve),
@@ -109,7 +122,7 @@ async def run_cli(
     print("=" * 50)
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:  # noqa: ASYNC230 - one-off CLI startup read
             config = MASCConfig.model_validate_json(f.read())
     except Exception as e:
         print(f"❌ Failed to parse config file '{config_path}': {e}")
@@ -123,11 +136,18 @@ async def run_cli(
     initial_artifact: Optional[str] = None
     if artifact_file:
         try:
-            with open(artifact_file, "r", encoding="utf-8") as af:
+            with open(artifact_file, encoding="utf-8") as af:  # noqa: ASYNC230 - one-off CLI startup read
                 initial_artifact = af.read()
         except Exception as e:
             print(f"❌ Failed to read initial artifact file '{artifact_file}': {e}")
             sys.exit(1)
+
+    try:
+        validate_task_inputs(task, initial_artifact)
+        validate_masc_config(config)
+    except ConfigValidationError as e:
+        print(f"❌ Invalid configuration: {e}")
+        sys.exit(1)
 
     thread_id = str(uuid.uuid4())
     print(f"Task: {task}")
@@ -166,6 +186,7 @@ async def run_cli(
 
 
 def main():
+    configure_logging()
     parser = argparse.ArgumentParser(description="MASC General-Purpose Dialectical AI")
     parser.add_argument("--task", type=str, help="The prompt or goal for the MASC workflow.")
     parser.add_argument("--config", type=str, help="Path to the JSON configuration file.")
@@ -208,7 +229,7 @@ def main():
         print("\nError: Both --task and --config are required to run an execution.")
         sys.exit(1)
 
-    asyncio.run(
+    run_async(
         run_cli(
             args.task,
             args.config,

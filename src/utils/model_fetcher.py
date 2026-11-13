@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 # Fallbacks ensure the UI never breaks if an API key is missing or invalid
 FALLBACK_MODELS = {
     "OpenAI": ["gpt-5.2-pro", "gpt-5.2-thinking", "gpt-5.2-instant", "o3-mini"],
-    "Anthropic": ["claude-4.6-opus", "claude-4.5-sonnet", "claude-4.5-haiku"],
+    "Anthropic": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
     "Google": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
     "Ollama": ["deepseek-r1", "llama-3.3", "mistral", "qwen2.5"],
 }
@@ -33,7 +33,7 @@ async def fetch_available_models(provider: str, api_key: str = "", base_url: str
                 response.raise_for_status()
                 data = response.json()
                 # Filter for core chat/reasoning models
-                models = [m["id"] for m in data.get("data", []) if m["id"].startswith(("gpt", "o1", "o3"))]
+                models = [m["id"] for m in data.get("data", []) if m["id"].startswith(("gpt", "o1", "o3", "o4"))]
                 models.sort(reverse=True)
                 return models or FALLBACK_MODELS["OpenAI"]
 
@@ -44,7 +44,9 @@ async def fetch_available_models(provider: str, api_key: str = "", base_url: str
                     "x-api-key": api_key,
                     "anthropic-version": "2023-06-01",
                 }
-                response = await client.get("https://api.anthropic.com/v1/models", headers=headers)
+                response = await client.get(
+                    "https://api.anthropic.com/v1/models", headers=headers, params={"limit": 100}
+                )
                 response.raise_for_status()
                 data = response.json()
                 models = [m["id"] for m in data.get("data", []) if m["id"].startswith("claude")]
@@ -53,16 +55,17 @@ async def fetch_available_models(provider: str, api_key: str = "", base_url: str
             elif provider == "Google":
                 if not api_key:
                     return FALLBACK_MODELS["Google"]
+                # Send the key as a header, never as a ?key= query parameter: httpx includes the full
+                # request URL in error messages, which would leak the key into logs.
                 response = await client.get(
                     "https://generativelanguage.googleapis.com/v1beta/models",
-                    params={"key": api_key},
+                    headers={"x-goog-api-key": api_key},
+                    params={"pageSize": 1000},
                 )
                 response.raise_for_status()
                 data = response.json()
                 models = [
-                    m["name"].replace("models/", "")
-                    for m in data.get("models", [])
-                    if "gemini" in m["name"].lower()
+                    m["name"].replace("models/", "") for m in data.get("models", []) if "gemini" in m["name"].lower()
                 ]
                 models.sort(reverse=True)
                 return models or FALLBACK_MODELS["Google"]

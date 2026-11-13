@@ -1,19 +1,23 @@
 import logging
+import os
 import secrets
 import uuid
 from contextlib import asynccontextmanager
 
-import gradio as gr
+# Gradio sends usage analytics to third parties by default; opt out unless explicitly enabled.
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+
+import gradio as gr  # noqa: E402
 from fastapi import FastAPI
 
 from src.config.settings import settings, validate_base_url
 from src.core.engine import close_pg_pool, execute_masc_workflow, resume_masc_workflow
-from src.core.personas import ADVERSARY_PERSONAS, load_personas
+from src.core.personas import get_persona_registry
 from src.core.state import CritiquesCollection, LLMConfig, MASCConfig, PersonaConfig
+from src.core.validation import ConfigValidationError, validate_masc_config
 from src.utils.model_fetcher import FALLBACK_MODELS, fetch_available_models
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def verify_gradio_auth(_username: str, password: str) -> bool:
@@ -74,7 +78,7 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
         adv_inputs = config_inputs[19:]
 
         for slot_idx in range(settings.max_adversaries):
-            chunk = adv_inputs[slot_idx * 7: (slot_idx + 1) * 7]
+            chunk = adv_inputs[slot_idx * 7 : (slot_idx + 1) * 7]
             if chunk[0] != "NONE":
                 adv_base_url = validate_base_url(chunk[3], settings) if chunk[3] else None
                 adv_llm_cfg = LLMConfig(
@@ -103,6 +107,10 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
             require_human_approval=require_human_approval_input,
             initial_artifact=cleaned_initial_artifact,
         )
+        try:
+            validate_masc_config(masc_config)
+        except ConfigValidationError as exc:
+            raise gr.Error(str(exc)) from exc
 
         progress(0.05, desc="Compiling MASC Graph & Connecting to Telemetry...")
         thread_id = str(uuid.uuid4())
@@ -234,7 +242,7 @@ async def run_masc_t_cycle(task_desc, initial_artifact_text, *config_inputs, pro
         raise
     except Exception as e:
         logger.exception(f"Gradio execution error: {e}")
-        raise gr.Error(f"Execution failed: {e}")
+        raise gr.Error(f"Execution failed: {e}") from e
 
 
 async def handle_hitl_resume(thread_id: str, critiques_data, approve: bool):
@@ -284,8 +292,22 @@ async def handle_hitl_resume(thread_id: str, critiques_data, approve: bool):
     yield gr.skip(), final_synthesis_content, history_md, gr.update(visible=False)
 
 
+# Gradio detects streaming handlers with inspect.isasyncgenfunction(fn). A lambda that merely *returns*
+# an async generator fails that check, so the approve/reject buttons need real async generator functions.
+async def approve_and_resume(thread_id: str, critiques_data):
+    """Gradio handler: approve (optionally edited) critiques and resume synthesis."""
+    async for update in handle_hitl_resume(thread_id, critiques_data, True):
+        yield update
+
+
+async def reject_and_abort(thread_id: str, critiques_data):
+    """Gradio handler: reject the pending critiques and abort the paused workflow."""
+    async for update in handle_hitl_resume(thread_id, critiques_data, False):
+        yield update
+
+
 def create_persona_ui(persona_name, is_adversary=False):
-    available_personas = {**ADVERSARY_PERSONAS, **load_personas()}
+    available_personas = get_persona_registry()
     with gr.Accordion(f"{persona_name} Configuration", open=True):
         persona_selector = None
         if is_adversary:
@@ -353,6 +375,7 @@ def create_persona_ui(persona_name, is_adversary=False):
         refresh_btn.click(fn=trigger_model_fetch, inputs=[provider, api_key, base_url], outputs=[model])
 
         if is_adversary:
+
             def toggle_adversary_inputs(persona_type):
                 disabled = persona_type == "NONE"
                 return [gr.update(interactive=not disabled)] * 6
@@ -370,6 +393,11 @@ def create_persona_ui(persona_name, is_adversary=False):
 # FastAPI
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if not settings.masc_api_key:
+        logger.warning(
+            "MASC_API_KEY is not set: the Gradio Studio has no login and anyone who can reach it can spend the "
+            "server's LLM provider credentials. Set MASC_API_KEY before exposing this service."
+        )
     # Startup: the PG pool initializes dynamically when engine.py needs it
     yield
     # Shutdown: Safely drain and close the connection pool to prevent zombie connections
@@ -387,7 +415,7 @@ async def ui_health_check():
 
 def build_gradio_blocks() -> gr.Blocks:
     """Constructs the Gradio Studio interface without polluting module-level scope."""
-    with gr.Blocks(theme=gr.themes.Soft(), title="MASC Enterprise Studio") as blocks:
+    with gr.Blocks(title="MASC Enterprise Studio") as blocks:
         gr.Markdown("# MASC: Advanced Workflow Studio")
         all_ui_inputs = []
         active_thread_state = gr.State(value="")
@@ -498,13 +526,13 @@ def build_gradio_blocks() -> gr.Blocks:
         )
 
         approve_resume_btn.click(
-            fn=lambda tid, c_json: handle_hitl_resume(tid, c_json, True),
+            fn=approve_and_resume,
             inputs=[active_thread_state, critiques_output],
             outputs=[critiques_output, final_synthesis_output, history_output, hitl_controls_row],
         )
 
         reject_abort_btn.click(
-            fn=lambda tid, c_json: handle_hitl_resume(tid, c_json, False),
+            fn=reject_and_abort,
             inputs=[active_thread_state, critiques_output],
             outputs=[critiques_output, final_synthesis_output, history_output, hitl_controls_row],
         )
@@ -518,9 +546,10 @@ fastapi_app = gr.mount_gradio_app(
     app,
     path="/",
     auth=verify_gradio_auth if settings.masc_api_key else None,
+    theme=gr.themes.Soft(),
 )
 
 if __name__ == "__main__":
-    import uvicorn
+    from src.utils.runtime import serve
 
-    uvicorn.run("src.entrypoints.gradio_ui:fastapi_app", host="0.0.0.0", port=7860)
+    serve(fastapi_app, port=7860)

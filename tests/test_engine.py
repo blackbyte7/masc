@@ -390,9 +390,7 @@ async def test_adversarial_analysis_raises_when_all_fail(base_masc_config, monke
 
 
 @pytest.mark.asyncio
-async def test_synthesize_sequential_batches_per_adversary_and_enforces_response_schema(
-    base_masc_config, monkeypatch
-):
+async def test_synthesize_sequential_batches_per_adversary_and_enforces_response_schema(base_masc_config, monkeypatch):
     nodes = MASCNodes(settings)
     fake_llm = _StructuredFakeChatModel(
         responses=[

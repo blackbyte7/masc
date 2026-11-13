@@ -1,28 +1,20 @@
 import importlib
-import inspect
-import json
 import logging
-import sys
 import uuid
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Optional
 
-from src.config.settings import settings, validate_base_url
 from src.core.engine import close_pg_pool, execute_masc_workflow, resume_masc_workflow
-from src.core.personas import ADVERSARY_PERSONAS, load_personas, resolve_adversary_persona
 from src.core.state import CritiquesCollection, MASCConfig
+from src.core.validation import ConfigValidationError, validate_masc_config, validate_task_inputs
 
-# Strictly log to stderr so MCP stdio JSON-RPC messages on stdout are never corrupted
-logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logger = logging.getLogger(__name__)
 
 
 class _FallbackMCP:
     """Lightweight fallback when neither 'mcp' nor 'fastmcp' is installed in a test environment."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, **_kwargs: Any) -> None:
         self.name = name
 
     @staticmethod
@@ -34,7 +26,16 @@ class _FallbackMCP:
 
     @staticmethod
     def run() -> None:
-        raise RuntimeError("Neither 'mcp' nor 'fastmcp' package is installed. Run: pip install mcp fastmcp")
+        raise RuntimeError("The 'mcp' package is not installed. Run: pip install mcp")
+
+
+@asynccontextmanager
+async def _server_lifespan(_server: Any) -> AsyncIterator[None]:
+    """Keeps the shared PostgreSQL pool open for the server's lifetime and drains it once on shutdown."""
+    try:
+        yield
+    finally:
+        await close_pg_pool()
 
 
 def _create_mcp_server(server_name: str) -> Any:
@@ -42,11 +43,16 @@ def _create_mcp_server(server_name: str) -> Any:
     for module_name in ("mcp.server.fastmcp", "fastmcp"):
         try:
             mod = importlib.import_module(module_name)
-            fastmcp_cls: Any = getattr(mod, "FastMCP", None)
-            if callable(fastmcp_cls):
-                return fastmcp_cls(server_name)
         except ImportError:
             continue
+        fastmcp_cls: Any = getattr(mod, "FastMCP", None)
+        if not callable(fastmcp_cls):
+            continue
+        try:
+            return fastmcp_cls(server_name, lifespan=_server_lifespan)
+        except TypeError:
+            # Older FastMCP releases do not accept a lifespan hook.
+            return fastmcp_cls(server_name)
     return _FallbackMCP(server_name)
 
 
@@ -58,6 +64,17 @@ def _register_mcp_tool(server: Any, func: Any) -> None:
 
 
 mcp = _create_mcp_server("MASC-Dialectics")
+
+
+def _format_interrupt(thread_id: str, interrupt_data: dict[str, Any], resumed: bool = False) -> str:
+    critiques_obj = interrupt_data.get("critiques_collection")
+    critiques_str = critiques_obj.model_dump_json(indent=2) if hasattr(critiques_obj, "model_dump_json") else "{}"
+    prefix = "MASC Resumed Audit Paused Again" if resumed else "MASC Audit Paused"
+    return (
+        f"{prefix} for Human Approval (thread_id: {thread_id}, turn: {interrupt_data.get('current_turn', 1)}).\n"
+        "Call resume_masc_audit to approve, edit or reject the pending critiques.\n\n"
+        f"### Pending Critiques:\n{critiques_str}"
+    )
 
 
 async def trigger_masc_audit(
@@ -74,60 +91,27 @@ async def trigger_masc_audit(
         initial_artifact: Optional existing code/text artifact to audit directly without running the Proposer node.
     """
     try:
-        if not task_description or not task_description.strip():
-            return "MASC Validation Error: task_description cannot be empty."
-        if len(task_description) > settings.max_task_length:
-            return f"MASC Validation Error: task_description exceeds max length ({settings.max_task_length})."
-
-        config = MASCConfig.model_validate_json(config_json)
-        if len(config.adversaries) > settings.max_adversaries:
-            return f"MASC Validation Error: Exceeded max adversaries ({settings.max_adversaries})."
-        if config.max_turns > settings.max_turns_limit:
-            return f"MASC Validation Error: Exceeded max turns limit ({settings.max_turns_limit})."
-
-        available_personas = {**ADVERSARY_PERSONAS, **load_personas()}
-        invalid_personas = []
-        for adv in config.adversaries:
-            try:
-                resolve_adversary_persona(adv, available_personas)
-            except ValueError:
-                invalid_personas.append(adv.persona_name)
-
-        if invalid_personas:
-            return f"MASC Validation Error: Unknown adversary persona(s): {invalid_personas}."
-
-        for persona in [config.proposer, config.synthesizer, *config.adversaries]:
-            validate_base_url(persona.llm_config.base_url, settings)
+        try:
+            validate_task_inputs(task_description, initial_artifact)
+            config = MASCConfig.model_validate_json(config_json)
+            validate_masc_config(config)
+        except (ConfigValidationError, ValueError) as exc:
+            return f"MASC Validation Error: {exc}"
 
         thread_id = str(uuid.uuid4())
         final_state = None
 
-        sig = inspect.signature(execute_masc_workflow)
-        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        if "initial_artifact" in sig.parameters or has_var_kw:
-            workflow_gen = execute_masc_workflow(
-                task_description, config, thread_id, initial_artifact=initial_artifact
-            )
-        else:
-            workflow_gen = execute_masc_workflow(task_description, config, thread_id)
-
-        async for state in workflow_gen:
+        async for state in execute_masc_workflow(
+            task_description, config, thread_id, initial_artifact=initial_artifact
+        ):
             final_state = state
 
         if not final_state:
             return "Error: Workflow failed to produce any output."
 
-        last_node_name = list(final_state.keys())[0]
+        last_node_name = next(iter(final_state))
         if last_node_name == "__interrupt__":
-            interrupt_data = final_state["__interrupt__"]
-            critiques_obj = interrupt_data.get("critiques_collection")
-            critiques_str = (
-                critiques_obj.model_dump_json(indent=2) if hasattr(critiques_obj, "model_dump_json") else "{}"
-            )
-            return (
-                f"MASC Audit Paused for Human Approval (thread_id: {thread_id}).\n\n"
-                f"### Pending Critiques:\n{critiques_str}"
-            )
+            return _format_interrupt(thread_id, final_state["__interrupt__"])
 
         final_artifact = final_state[last_node_name].get("current_artifact")
 
@@ -143,9 +127,8 @@ async def trigger_masc_audit(
         )
 
     except Exception as e:
+        logger.exception("MCP trigger_masc_audit failed")
         return f"MASC Execution Error: {str(e)}"
-    finally:
-        await close_pg_pool()
 
 
 async def resume_masc_audit(
@@ -162,11 +145,7 @@ async def resume_masc_audit(
         critiques_override_json: Optional JSON string of CritiquesCollection to replace pending critiques.
     """
     try:
-        override = (
-            CritiquesCollection.model_validate_json(critiques_override_json)
-            if critiques_override_json
-            else None
-        )
+        override = CritiquesCollection.model_validate_json(critiques_override_json) if critiques_override_json else None
         final_state = None
         async for state in resume_masc_workflow(
             thread_id=thread_id,
@@ -176,15 +155,17 @@ async def resume_masc_audit(
             final_state = state
 
         if not final_state:
-            return "Error: Resumed workflow produced no output."
+            return f"Error: Resumed workflow on '{thread_id}' produced no output (is the thread paused?)."
 
-        last_node_name = list(final_state.keys())[0]
+        last_node_name = next(iter(final_state))
         if last_node_name == "aborted":
             return f"MASC Workflow on thread '{thread_id}' was aborted by reviewer."
+        if last_node_name == "__interrupt__":
+            return _format_interrupt(thread_id, final_state["__interrupt__"], resumed=True)
 
         final_artifact = final_state[last_node_name].get("current_artifact")
         if not final_artifact:
-            return f"MASC Workflow resumed on '{thread_id}', state: {json.dumps(final_state, default=str)}"
+            return f"Error: Resumed workflow on '{thread_id}' completed without a hardened artifact."
 
         history_formatted = "\n".join([f"- {h}" for h in final_artifact.history])
         return (
@@ -193,14 +174,23 @@ async def resume_masc_audit(
             f"### Final Hardened Output:\n\n{final_artifact.content}"
         )
     except Exception as e:
+        logger.exception("MCP resume_masc_audit failed")
         return f"MASC Resume Error: {str(e)}"
-    finally:
-        await close_pg_pool()
 
 
 _register_mcp_tool(mcp, trigger_masc_audit)
 _register_mcp_tool(mcp, resume_masc_audit)
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Runs the MCP server over stdio with MASC logging and a psycopg-compatible event loop."""
+    from src.utils.logging_config import configure_logging
+    from src.utils.runtime import configure_event_loop_policy
+
+    configure_logging()
+    configure_event_loop_policy()
     mcp.run()
+
+
+if __name__ == "__main__":
+    run()

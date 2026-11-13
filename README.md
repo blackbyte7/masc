@@ -7,6 +7,9 @@
 </div>
 
 <p align="center">
+  <a href="https://github.com/blackbyte7/masc/actions/workflows/ci.yml">
+    <img src="https://github.com/blackbyte7/masc/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
   <a href="https://opensource.org/licenses/MIT">
     <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
   </a>
@@ -87,49 +90,43 @@ optional PostgreSQL database is supported. Docker Compose is the recommended way
 ### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/your-username/masc.git](https://github.com/your-username/masc.git)
+git clone https://github.com/blackbyte7/masc.git
 cd masc
-
 ```
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the root directory. MASC will automatically route to the correct provider based on your workflow
-configuration.
+Copy the documented template and fill in only the providers you use. MASC routes each node to the provider
+named in your workflow configuration.
+
+```bash
+cp .env.example .env
+```
+
+The most important settings:
 
 ```env
-# -----------------------------
-# LLM Provider Keys
-# -----------------------------
+# LLM provider keys (Ollama needs none)
 OPENAI_API_KEY="sk-proj-..."
 ANTHROPIC_API_KEY="sk-ant-..."
 GOOGLE_API_KEY="AIza..."
 
-# -----------------------------
-# Security & Rate Limiting (Optional)
-# -----------------------------
-# Protects both the FastAPI server (Bearer token) and Gradio Studio UI (login password)
-# MASC_API_KEY="your-production-bearer-token"
-# RATE_LIMIT_PER_MINUTE=60
-# MAX_CONCURRENT_LLM_CALLS=10
-# ALLOWED_BASE_URLS='["http://localhost:11434","[http://127.0.0.1:11434](http://127.0.0.1:11434)","[http://host.docker.internal:11434](http://host.docker.internal:11434)"]'
-# ALLOW_CUSTOM_BASE_URLS=false
+# Protects both the FastAPI server (Bearer token) and the Gradio Studio (login password).
+# Strongly recommended for anything reachable beyond localhost.
+MASC_API_KEY="your-production-bearer-token"
 
-# -----------------------------
-# Observability (Optional)
-# -----------------------------
-LANGFUSE_PUBLIC_KEY="pk-lf-..."
-LANGFUSE_SECRET_KEY="sk-lf-..."
-# Use [https://us.cloud.langfuse.com](https://us.cloud.langfuse.com) if using US data residency
-LANGFUSE_HOST="[https://cloud.langfuse.com](https://cloud.langfuse.com)"
+# Optional Langfuse tracing (SDK v3+). Use https://us.cloud.langfuse.com for US data residency.
+# LANGFUSE_PUBLIC_KEY="pk-lf-..."
+# LANGFUSE_SECRET_KEY="sk-lf-..."
+# LANGFUSE_HOST="https://cloud.langfuse.com"
 
-# -----------------------------
-# State Persistence
-# -----------------------------
-# Defaults to memory:// outside of Docker. Docker Compose configures PostgreSQL automatically.
+# Defaults to memory:// outside Docker; Docker Compose configures PostgreSQL automatically.
+# Both postgresql:// and postgresql+psycopg:// are accepted.
 # DATABASE_URL="postgresql://masc_user:masc_pass@localhost:5432/masc_db"
-
 ```
+
+See [`.env.example`](.env.example) for every option (rate limiting, CORS, proxy headers, SSRF allowlist, limits,
+logging).
 
 ### 3. Build and Start the Infrastructure
 
@@ -137,7 +134,14 @@ Spin up PostgreSQL, the FastAPI server (`masc-api`), and the Gradio Studio (`mas
 
 ```bash
 docker compose up -d
+```
 
+### Running natively (without Docker)
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python main.py --mode ui        # or: api | cli | mcp   (see --help, --host, --port, --version)
 ```
 
 ---
@@ -154,7 +158,6 @@ dialectical process unfold in real-time (including interactive Human-in-the-Loop
 ```bash
 # If running locally without Docker:
 python main.py --mode ui
-
 ```
 
 *Navigate to `http://127.0.0.1:7860` in your browser. If `MASC_API_KEY` is configured, log in with any username and your `MASC_API_KEY` as the password.*
@@ -167,28 +170,28 @@ keep-alive heartbeats, thread state inspection, HITL resumption, and drop-in Ope
 ```bash
 # If running locally without Docker:
 python main.py --mode api
-
 ```
 
-*The server runs on `http://0.0.0.0:8000`.*
+*The server runs on `http://0.0.0.0:8000`. Interactive OpenAPI docs are served at `/docs`.*
 
-* **Native MASC Endpoints:**
-* `POST /v1/masc/execute` — Execute or audit an artifact (`task_description`, `config`, optional `initial_artifact`, optional `thread_id`) via SSE stream.
-* `GET /v1/masc/threads/{thread_id}` — Inspect checkpointed thread state and `awaiting_human_approval` status.
-* `POST /v1/masc/threads/{thread_id}/resume` — Approve, reject, or override `critiques_collection` on a paused HITL thread and stream the resumed synthesis.
-* `GET /health` — Health check probe.
+**Native MASC endpoints**
 
+* `POST /v1/masc/execute`: execute or audit an artifact via an SSE stream. The body takes `task_description` and `config`, plus optional `initial_artifact` and `thread_id`.
+* `GET /v1/masc/threads/{thread_id}`: inspect checkpointed thread state, including `awaiting_human_approval`.
+* `POST /v1/masc/threads/{thread_id}/resume`: approve, reject or override `critiques_collection` on a paused HITL thread, and stream the resumed synthesis. Returns `409` if the thread is not paused.
+* `GET /health`: health-check probe (unauthenticated).
 
-* **OpenAI-Compatible Endpoints (for Cursor, Continue, OpenWebUI, LangChain):**
-* `GET /v1/models` — Lists virtual preset models:
-* `masc-sequential-default` (`DA` + `UncertaintyQuantifier`)
-* `masc-architect-default` (`DA` + `ContextualChallenger`)
-* `masc-security-audit` (`SecurityHawk` + `CodeAuditor` + static verification tools)
-* `masc-auto` (Auto-Persona Router + static verification tools)
+**OpenAI-compatible endpoints** (for Cursor, Continue, OpenWebUI, LangChain)
 
+* `GET /v1/models` lists the virtual preset models:
+  * `masc-sequential-default` (`DA` + `UncertaintyQuantifier`)
+  * `masc-architect-default` (`DA` + `ContextualChallenger`)
+  * `masc-security-audit` (`SecurityHawk` + `CodeAuditor` + static verification tools)
+  * `masc-auto` (Auto-Persona Router + static verification tools)
+* `POST /v1/chat/completions` accepts standard OpenAI chat completions: `stream=false` returns JSON, `stream=true` returns SSE chunks with keep-alive heartbeats, and `stream_options.include_usage` is supported. A full `masc_config` override is subject to the same server limits as `/v1/masc/execute`.
 
-* `POST /v1/chat/completions` — Standard OpenAI chat completions (supports both `stream=false` JSON and `stream=true` SSE chunks, plus `stream_options.include_usage`).
-
+All endpoints except `/health` require `Authorization: Bearer $MASC_API_KEY` when `MASC_API_KEY` is set.
+Execution endpoints are rate-limited per client IP (`RATE_LIMIT_PER_MINUTE`).
 
 
 ### 3. Command Line Interface (CLI Mode)
@@ -199,14 +202,12 @@ First, generate a base configuration file:
 
 ```bash
 python main.py --mode cli --generate-template config.json
-
 ```
 
 Execute a workflow from scratch:
 
 ```bash
 python main.py --mode cli --task "Draft a migration strategy to microservices." --config config.json
-
 ```
 
 Audit an existing file directly (skipping the Proposer) with the optional Auto-Persona Router and Deterministic Verification:
@@ -219,8 +220,11 @@ python main.py --mode cli \
   --auto-personas \
   --verify-tools \
   --approve-all
-
 ```
+
+If `require_human_approval` is enabled, the CLI prompts for approval in an interactive terminal. In
+non-interactive runs it leaves the thread paused unless `--approve-all` is passed, so a HITL gate is never
+approved silently.
 
 ### 4. Model Context Protocol (MCP Mode) via Docker
 
@@ -241,22 +245,35 @@ LangChain agents) over `stdio`. Two MCP tools are registered:
         "compose",
         "-f",
         "/absolute/path/to/masc/docker-compose.yml",
+        "--profile",
+        "mcp",
         "run",
         "--rm",
         "-i",
-        "masc-api",
-        "python",
-        "main.py",
-        "--mode",
-        "mcp"
+        "masc-mcp"
       ]
     }
   }
 }
-
 ```
 
-*Note: Replace `/absolute/path/to/masc/docker-compose.yml` with the actual path to your cloned directory.*
+*Note: Replace `/absolute/path/to/masc/docker-compose.yml` with the actual path to your cloned directory. The
+dedicated `masc-mcp` service publishes no ports. All logs go to stderr, so the stdio JSON-RPC channel stays
+clean.*
+
+Running natively instead of through Docker:
+
+```json
+{
+  "mcpServers": {
+    "MASC-Dialectics": {
+      "command": "/absolute/path/to/masc/.venv/bin/python",
+      "args": ["/absolute/path/to/masc/main.py", "--mode", "mcp"],
+      "cwd": "/absolute/path/to/masc"
+    }
+  }
+}
+```
 
 ---
 
@@ -269,7 +286,7 @@ following optional fields:
 | --- | --- | --- | --- |
 | `initial_artifact` | `Optional[str]` | `null` | Existing text/code to audit directly, skipping the `propose` node. |
 | `auto_select_adversaries` | `bool` | `false` | Optional router that dynamically selects 1–3 relevant personas from the registry based on the task. |
-| `stop_on_max_severity` | `"CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "NONE"` | `"LOW"` | Minimum critique severity required to continue looping across turns. |
+| `stop_on_max_severity` | `"CRITICAL"` \| `"HIGH"` \| `"MEDIUM"` \| `"LOW"` \| `"NONE"` | `"LOW"` | Minimum critique severity required to continue looping across turns. |
 | `batch_constructive_critiques` | `bool` | `false` | Merges all constructive critiques into a single synthesis pass per turn in Sequential mode. |
 | `enable_verification_tools` | `bool` | `false` | Runs deterministic Python AST, JSON, and secret-pattern checks and injects findings into adversary prompts. |
 | `require_human_approval` | `bool` | `false` | Pauses execution before synthesis (`__interrupt__`) until resumed via `/resume`, UI, CLI, or MCP. |
@@ -310,7 +327,6 @@ Create `custom_personas.json` in the project root (or set `MASC_PERSONAS_FILE`):
     "system_prompt": "Act as a pure antagonist. Identify the core business value claimed by the text and formulate a devastating argument as to why the endeavor is financially ruinous. Do not offer solutions. Your output is designed to be refuted, not integrated. Provide your output as a list of critique items with 'severity' (always 'HIGH'), 'description', and 'recommendation' fields."
   }
 }
-
 ```
 
 ### 2. Ephemeral Inline Personas (Per-Request)
@@ -329,7 +345,6 @@ In API, CLI, or MCP configurations, any entry in `adversaries` can supply `criti
     "max_tokens": 4096
   }
 }
-
 ```
 
 ---
@@ -342,6 +357,30 @@ In API, CLI, or MCP configurations, any entry in `adversaries` can supply `criti
 
 ---
 
+## 🔐 Security
+
+* Per-request LLM API keys are **never written to checkpoints**. They are held in a bounded, process-local vault for the lifetime of the run and stripped from every API response.
+* Custom `base_url`s are allowlisted (`ALLOWED_BASE_URLS`), cloud-metadata and link-local targets are always blocked, and a custom `base_url` requires an explicit API key, so server credentials can't be exfiltrated.
+* `X-Forwarded-For` is trusted for rate limiting only when `TRUST_PROXY_HEADERS=true`.
+
+Before exposing MASC beyond `localhost`, set `MASC_API_KEY`, change `POSTGRES_PASSWORD`, restrict `CORS_ORIGINS` and terminate TLS at a reverse proxy.
+Please report vulnerabilities privately through [GitHub Security Advisories](https://github.com/blackbyte7/masc/security/advisories/new) rather than public issues.
+
+---
+
+## 🧪 Development
+
+```bash
+pip install -r requirements-dev.txt
+ruff check . && ruff format --check .
+pytest --cov=src
+```
+
+The test suite is fully offline and hermetic: it never reads your `.env` or calls real providers. CI runs lint,
+tests on Python 3.10 – 3.13, and a Docker build on every pull request. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
 ## ⚖️ License
 
-This project is licensed under the MIT License. See the LICENSE file for the full text.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for the full text.

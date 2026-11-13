@@ -17,7 +17,8 @@ def clear_rate_limit_buckets():
 def test_health_endpoint(test_client):
     response = test_client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "healthy"}
+    assert response.json()["status"] == "healthy"
+    assert response.json()["version"]
 
 
 def test_execute_masc_endpoint_validation_error(test_client):
@@ -91,9 +92,7 @@ def test_execute_masc_accepts_inline_custom_persona(test_client, base_masc_confi
     assert "Audited by inline persona" in response.text
 
 
-def test_execute_masc_accepts_empty_adversaries_when_auto_router_enabled(
-    test_client, base_masc_config, monkeypatch
-):
+def test_execute_masc_accepts_empty_adversaries_when_auto_router_enabled(test_client, base_masc_config, monkeypatch):
     async def fake_workflow(_task_description, _config, _thread_id, **_kwargs):
         yield {
             "synthesize_sequential": {
@@ -201,11 +200,7 @@ def test_execute_masc_sse_stream_and_redaction(test_client, base_masc_config, mo
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
 
-    events = [
-        line.removeprefix("data: ")
-        for line in response.text.splitlines()
-        if line.startswith("data: ")
-    ]
+    events = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
     assert events[-1] == "[DONE]"
 
     first_event = json.loads(events[0])

@@ -1,5 +1,7 @@
-# Environments
+# Environments & secrets
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -34,14 +36,21 @@ wheels/
 *.sqlite3
 pgdata/
 
-# IDEs and Tools
+# IDEs and tools
 .idea/
 .vscode/
 *.swp
 *.swo
 .DS_Store
 
-# Pytest / Coverage
+# Test / lint caches & coverage
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+
+# Generated code dumps (e.g. repomix)
+repomix-output.*

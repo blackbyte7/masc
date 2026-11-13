@@ -1,8 +1,10 @@
 # Git
 .git
 .gitignore
+.gitattributes
+.github
 
-# Environments & Secrets
+# Environments & secrets
 .env
 .env.*
 .venv
@@ -25,11 +27,17 @@ wheels/
 *.sqlite3
 pgdata/
 
-# Tests & Coverage
+# Tests, tooling & coverage
 tests/
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
+
+# Docs & repo meta (not needed at runtime)
+*.md
+docs/
+repomix-output.*
 
 # IDEs & OS files
 .idea/
@@ -37,4 +45,3 @@ htmlcov/
 *.swp
 *.swo
 .DS_Store
-README.md

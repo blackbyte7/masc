@@ -68,7 +68,7 @@ DEFAULT_ADVERSARY_PERSONAS = {
     },
 }
 
-_CODE_BLOCK_RE = re.compile(r"```(?P<lang>[a-zA-Z0-9_+-]*)\n(?P<code>.*?)```", re.DOTALL)
+_CODE_BLOCK_RE = re.compile(r"```(?P<lang>[a-zA-Z0-9_+-]*)[ \t]*\r?\n(?P<code>.*?)```", re.DOTALL)
 _SECRET_PATTERNS = [
     ("OpenAI API Key pattern", re.compile(r"sk-[a-zA-Z0-9]{20,}")),
     ("AWS Access Key ID pattern", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -146,7 +146,7 @@ def load_personas() -> dict:
 
     if os.path.exists(custom_file_path):
         try:
-            with open(custom_file_path, "r", encoding="utf-8") as f:
+            with open(custom_file_path, encoding="utf-8") as f:
                 custom_personas = json.load(f)
 
             if not isinstance(custom_personas, dict):
@@ -171,7 +171,7 @@ def load_personas() -> dict:
                         f"Skipping custom persona '{name}': Missing, invalid, or oversized 'critique_type' or 'system_prompt'."
                     )
 
-            logger.info(f"Successfully loaded {loaded_count} custom persona(s) from {custom_file_path}.")
+            logger.debug(f"Loaded {loaded_count} custom persona(s) from {custom_file_path}.")
         except Exception as e:
             logger.error(f"Failed to load custom personas from {custom_file_path}: {e}")
 
@@ -189,7 +189,7 @@ def resolve_adversary_persona(adv_config: PersonaConfig, registry: Optional[dict
             "system_prompt": adv_config.system_prompt.strip(),
         }
 
-    personas_map = registry if registry is not None else {**ADVERSARY_PERSONAS, **load_personas()}
+    personas_map = registry if registry is not None else get_persona_registry()
     if adv_config.persona_name in personas_map:
         return personas_map[adv_config.persona_name]
 
@@ -199,5 +199,13 @@ def resolve_adversary_persona(adv_config: PersonaConfig, registry: Optional[dict
     )
 
 
-# Populated at startup and refreshed dynamically via load_personas()
+def get_persona_registry() -> dict:
+    """
+    Returns the current persona registry (built-ins merged with custom_personas.json).
+    The custom file is re-read on every call so edits take effect without a restart.
+    """
+    return load_personas()
+
+
+# Snapshot populated at import time (kept for backwards compatibility); prefer get_persona_registry().
 ADVERSARY_PERSONAS = load_personas()

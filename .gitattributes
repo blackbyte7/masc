@@ -1,0 +1,6 @@
+# Normalise line endings in the repository; shell scripts must stay LF for Docker.
+* text=auto eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
